@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
 //|                                                  Simple_gold_v5.mq5 |
 //|                                      Copyright 2026, Bondarev A.   |
-//|  v5.12: WAIT валидация + pin-bar (M1, настраиваемый) + динамич. RR + BB    |
+//|  v5.13: WAIT + pin-bar + RR + сессии GMT (ASIA/LONDON/NY/OVERLAP)    |
 //+------------------------------------------------------------------+
-//| ОСНОВНЫЕ УЛУЧШЕНИЯ v5.12 (параметризация pin-bar):                                          |
+//| ОСНОВНЫЕ УЛУЧШЕНИЯ v5.13 (временные сессии GMT):                                          |
 //|                                                                    |
 //|  1. ФИКСАЦИЯ WAIT ЦИКЛА:                                           |
 //|     - ValidateWaitState() проверяет консистентность каждый тик    |
@@ -39,11 +39,20 @@
 //|     - Касание BB: считается на InpMainTF                          |
 //|     - Отрисовка линий: по InpMainTF (независимо от графика)       |
 //|                                                                    |
+//|  6. ВРЕМЕННЫЕ СЕССИИ (GMT) - гибкий фильтр для тестирования:     |
+//|     - ASIA: 00:00-08:00 (ночная сессия)                           |
+//|     - LONDON: 08:00-16:00 (европейская сессия)                    |
+//|     - NEWYORK: 13:00-21:00 (американская сессия)                  |
+//|     - OVERLAP: 13:00-16:00 (пересечение Лондона и НИ)            |
+//|     - Каждую сессию можно вкл/выкл отдельно для тестирования      |
+//|     - Вне сессии: блокируются новые входы, WAIT отменяется (опц.) |
+//|     - Главный выключатель: InpUseSessionFilter (вкл/выкл все)      |
+//|                                                                    |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Bondarev A."
 #property link      "https://www.mql5.com"
-#property version   "5.12"
-#property description "XAUUSD: WAIT валидация + pin-bar (M1, настраиваемое соотношение) + динамический RR + 4 фильтра + BB на InpMainTF"
+#property version   "5.13"
+#property description "XAUUSD: WAIT валидация + pin-bar (M1) + динамический RR + 4 фильтра + временные сессии GMT (ASIA/LONDON/NEWYORK/OVERLAP)"
 
 #include <Trade\Trade.mqh>
 
@@ -114,6 +123,14 @@ input int                InpRSIBB_BBPeriod    = 20;           // Период BB
 input double             InpRSIBB_BBDev       = 2.0;          // Отклонение BB
 input ENUM_RSIBB_MODE    InpRSIBB_Mode        = RSIBB_MODE_EXTREME; // Режим фильтра
 input double             InpRSIBB_Tolerance   = 0.0;          // Допуск от полосы (ед. RSI)
+
+input group "=== ВРЕМЕННЫЕ СЕССИИ (GMT) ==="
+input bool              InpUseSessionFilter   = true;         // ГЛАВНЫЙ ВЫКЛЮЧАТЕЛЬ: фильтр временных сессий
+input bool              InpEnableASIA         = true;         // Включить ASIATIC (00:00-08:00 GMT)
+input bool              InpEnableLONDON       = true;         // Включить LONDON (08:00-16:00 GMT)
+input bool              InpEnableNEWYORK      = true;         // Включить NEWYORK (13:00-21:00 GMT)
+input bool              InpEnableOVERLAP      = true;         // Включить OVERLAP (13:00-16:00 GMT пересечение)
+input bool              InpCancelWaitOutSession = true;       // Отменять WAIT при выходе из сессии
 
 input group "=== Нотификации ==="
 input bool              InpAlertEnable   = true;          // Показывать нотификации при касании полос
@@ -275,6 +292,16 @@ int OnInit()
    Print("  4. Волатильность: ВКЛ (10-100 пт ATR H1)");
    Print("Дополнительно: RSI-BB=", (InpUseRSIBB ? "ВКЛ" : "ВЫКЛ"), " (TF=", EnumToString(InpRSIBB_RSITF), ")");
    Print("Вход: pin-bar подтверждение + динамический RR (2.0-3.5)");
+   Print("\n========== ВРЕМЕННЫЕ СЕССИИ (GMT) ==========");
+   Print("Фильтр сессий: ", (InpUseSessionFilter ? "ВКЛ" : "ВЫКЛ"));
+   if(InpUseSessionFilter)
+   {
+      Print("  ASIA (00:00-08:00): ", (InpEnableASIA ? "ВКЛ" : "ВЫКЛ"));
+      Print("  LONDON (08:00-16:00): ", (InpEnableLONDON ? "ВКЛ" : "ВЫКЛ"));
+      Print("  NEWYORK (13:00-21:00): ", (InpEnableNEWYORK ? "ВКЛ" : "ВЫКЛ"));
+      Print("  OVERLAP (13:00-16:00): ", (InpEnableOVERLAP ? "ВКЛ" : "ВЫКЛ"));
+      Print("  Отмена WAIT при выходе из сессии: ", (InpCancelWaitOutSession ? "ВКЛ" : "ВЫКЛ"));
+   }
    Print("========================================\n");
    return INIT_SUCCEEDED;
 }
@@ -748,6 +775,61 @@ bool CheckPinBarConfirm(const int direction)  // direction: +1 = BUY, -1 = SELL
 }
 
 //+------------------------------------------------------------------+
+//| Проверка текущего времени в GMT сессиях                          |
+//| Возвращает: 1=ASIA, 2=LONDON, 3=NEWYORK, 4=OVERLAP, -1=вне сессий|
+//+------------------------------------------------------------------+
+int GetCurrentSession()
+{
+   // Если фильтр отключен - все сессии включены
+   if(!InpUseSessionFilter)
+      return 1;  // Вернуть любую активную сессию
+
+   datetime now = TimeCurrent();
+   int hour = TimeHour(now);
+
+   // OVERLAP: 13:00-16:00 (приоритет выше)
+   if(InpEnableOVERLAP && hour >= 13 && hour < 16)
+      return 4;
+
+   // ASIA: 00:00-08:00
+   if(InpEnableASIA && hour >= 0 && hour < 8)
+      return 1;
+
+   // LONDON: 08:00-16:00
+   if(InpEnableLONDON && hour >= 8 && hour < 16)
+      return 2;
+
+   // NEWYORK: 13:00-21:00
+   if(InpEnableNEWYORK && hour >= 13 && hour < 21)
+      return 3;
+
+   return -1;  // Вне всех сессий
+}
+
+//+------------------------------------------------------------------+
+//| Получить название сессии (для логирования и вывода)              |
+//+------------------------------------------------------------------+
+string GetSessionName(int sessionID)
+{
+   switch(sessionID)
+   {
+      case 1:  return "ASIA (00:00-08:00)";
+      case 2:  return "LONDON (08:00-16:00)";
+      case 3:  return "NEWYORK (13:00-21:00)";
+      case 4:  return "OVERLAP (13:00-16:00)";
+      default: return "OUT OF SESSION";
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Проверка: находимся ли мы в активной сессии (GMT)               |
+//+------------------------------------------------------------------+
+bool IsTimeInSession()
+{
+   return GetCurrentSession() != -1;
+}
+
+//+------------------------------------------------------------------+
 //| Фильтр волатильности (колебание ATR H1)                  |
 //+------------------------------------------------------------------+
 //+------------------------------------------------------------------+
@@ -803,6 +885,10 @@ void CheckAutoTrade()
 
    // [ENTRY_FILTER_1] Проверяем фильтр волатильности (ATR H1: 10-100 пт)
    if(!CheckVolatilityFilter())
+      return;
+
+   // [ENTRY_FILTER_2] Проверяем фильтр временных сессий (GMT)
+   if(InpUseSessionFilter && !IsTimeInSession())
       return;
 
    // Получаем последнюю свечу M1 (закрытую)
@@ -1075,6 +1161,19 @@ void CheckWaitCondition()
    // Если ручной WAIT - просто ждём нажатия кнопки, без проверки условий
    if(g_manualWait)
       return;
+
+   // [SESSION] Проверяем выход из активной сессии - отмена WAIT
+   if(InpCancelWaitOutSession && InpUseSessionFilter && !IsTimeInSession())
+   {
+      Print("[SESSION] Выход из активной сессии. Отмена WAIT режима.");
+      g_waiting = false;
+      g_breakLevel = 0;
+      g_autoDir = 0;
+      g_reverseDone = false;
+      g_waitStartTime = 0;
+      ClearSignal();
+      return;
+   }
 
    // Авто-WAIT: проверяем откат и таймаут
    if(g_breakLevel == 0 || (g_autoDir != 1 && g_autoDir != -1))
