@@ -1,7 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                                  Simple_gold_v5.mq5 |
 //|                                      Copyright 2026, Bondarev A.   |
-//|  v5.15: ОПТИМИЗИРОВАННАЯ + исправлена волатильность для XAUUSD |
+//|  v5.16: производительность (кэш индикаторов, чтение готовых       |
+//|         буферов BB вместо ручного расчёта, отключение графики/    |
+//|         Print/Comment в тестере без визуализации) + направленный  |
+//|         фильтр тренда (линейная регрессия по окну на своём ТФ)    |
 //+------------------------------------------------------------------+
 //| ОСНОВНЫЕ УЛУЧШЕНИЯ v5.14 (КОНФИГ для МАКСИМУМА ВХОДОВ - база оптимизации):                                          |
 //|                                                                    |
@@ -61,8 +64,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Bondarev A."
 #property link      "https://www.mql5.com"
-#property version   "5.15"
-#property description "XAUUSD: WAIT + pin-bar + RR + фильтры + сессии GMT (v5.15: исправлена волатильность для XAUUSD 50-2000 пт)"
+#property version   "5.16"
+#property description "XAUUSD: WAIT + pin-bar + RR + фильтры + сессии GMT + фильтр тренда (v5.16: перфоманс для оптимизации + trend-direction filter)"
 
 #include <Trade\Trade.mqh>
 
@@ -71,6 +74,14 @@ enum ENUM_RSIBB_MODE
 {
    RSIBB_MODE_EXTREME = 0,  // Экстремум: BUY при RSI<нижняя полоса, SELL при RSI>верхняя
    RSIBB_MODE_INSIDE  = 1   // Запрет экстремума: BUY пока RSI<верхняя, SELL пока RSI>нижняя
+};
+
+//-------------------- Состояние тренда (направленный фильтр) --------+
+enum ENUM_TREND_STATE
+{
+   TREND_BEAR = -1,   // выраженный нисходящий тренд
+   TREND_FLAT =  0,   // тренд не выражен (флэт)
+   TREND_BULL =  1    // выраженный восходящий тренд
 };
 
 //-------------------- Входные параметры -----------------------------+
@@ -150,6 +161,15 @@ input double            InpAlertTriggerPts = 50.0;         // Расстояни
 input bool              InpAlertLocal    = true;          // Локальные алерты
 input bool              InpAlertPush     = true;          // Push-нотификации
 
+input group "=== Фильтр тренда (направление входов по окну) ==="
+input bool              InpUseTrendDirFilter = false;      // Гл. выключатель: BUY только в BULL, SELL только в BEAR, FLAT - блок входов
+input ENUM_TIMEFRAMES   InpTrendTF           = PERIOD_H1;  // Таймфрейм для определения тренда (независим от InpMainTF)
+input int               InpTrendWindow       = 50;         // Окно линейной регрессии (кол-во баров InpTrendTF)
+input int               InpTrendATRPeriod    = 14;         // Период ATR (для нормализации силы тренда)
+input double            InpTrendMinSlopeATR  = 1.0;        // Мин. смещение линии регрессии за окно (в ATR), иначе FLAT
+input double            InpTrendMinR2        = 0.5;        // Мин. качество тренда R² (0..1): 1=идеальная линия, 0=шум
+input int               InpTrendRecalcBars   = 1;          // Пересчитывать тренд раз в N закрытых баров InpTrendTF (>=1)
+
 input group "=== Визуализация и дебуг ==="
 input bool              InpShowIndicators = true;         // Показывать BB, ATR и другие индикаторы на графике
 
@@ -163,6 +183,22 @@ int                  m_maHandle;       // трендовый фильтр (MA)
 int                  m_atrH1Handle;    // для отображения
 int                  m_rsiBBHandle;    // индикатор SG_RSI_BB (только график)
 int                  m_rsi2Handle;     // RSI на своём ТФ (для фильтра BB по RSI, напрямую)
+int                  m_trendAtrHandle = INVALID_HANDLE;  // ATR(InpTrendTF) для нормализации силы тренда
+
+bool                 g_fastMode = false;  // true = тестер без визуализации/оптимизация: графика/Comment/Print отключены
+
+//--- Кэш индикаторов, читается один раз за тик (см. RefreshTick), переиспользуется везде
+bool                 g_curValid  = false;
+double               g_curUp=0, g_curMid=0, g_curLow=0, g_curAtr=0, g_curRsi=50, g_curAdx=0;
+double               g_curDistUp=0, g_curDistLow=0;
+int                  g_curTouch  = 0;
+
+//--- Направленный фильтр тренда (линейная регрессия по отдельному ТФ/окну)
+int                  g_trendState    = TREND_FLAT;
+double               g_trendRangePts = 0;   // суммарное смещение линии регрессии за окно (пт)
+double               g_trendR2       = 0;   // качество/чистота тренда (0..1)
+double               g_trendATRRatio = 0;   // g_trendRangePts, нормированный на ATR(InpTrendTF)
+datetime             g_trendCalcTime = 0;   // время бара InpTrendTF, на котором пересчитан тренд
 
 ulong                g_autoPosTicket = 0;
 int                  g_autoDir       = 0;       // +1 buy, -1 sell
@@ -201,12 +237,28 @@ int OnInit()
    m_trade.SetTypeFillingBySymbol(m_symbol);
    m_trade.SetDeviationInPoints(50);
 
+   // В тестере без визуализации (включая генетическую оптимизацию) отключаем всю графику/Comment/Print
+   g_fastMode = (bool)MQLInfoInteger(MQL_TESTER) && !(bool)MQLInfoInteger(MQL_VISUAL_MODE);
+
    m_bbHandle  = iBands(m_symbol, InpMainTF, InpBBPeriod, 0, InpBBDev, InpBBApplied);
    m_atrHandle = iATR(m_symbol, InpMainTF, InpATRPeriod);
    m_atrH1Handle = iATR(m_symbol, PERIOD_H1, InpATRPeriod);
    m_rsiHandle = iRSI(m_symbol, InpMainTF, InpRSIPeriod, PRICE_CLOSE);
    m_adxHandle = iADX(m_symbol, InpMainTF, InpADXPeriod);
    m_maHandle  = iMA(m_symbol, InpMainTF, InpMATrendPeriod, 0, InpMAMethod, PRICE_CLOSE);
+
+   // Направленный фильтр тренда: хэндл ATR только при включённом фильтре
+   if(InpUseTrendDirFilter)
+   {
+      m_trendAtrHandle = iATR(m_symbol, InpTrendTF, InpTrendATRPeriod);
+      if(m_trendAtrHandle == INVALID_HANDLE)
+      {
+         Print("Ошибка создания ATR для фильтра тренда");
+         return INIT_FAILED;
+      }
+   }
+   else
+      m_trendAtrHandle = INVALID_HANDLE;
 
    // Фильтр BB по RSI: всё создаётся ТОЛЬКО при включённом фильтре.
    // При InpUseRSIBB=false советник работает как раньше - без лишних
@@ -260,6 +312,12 @@ int OnInit()
    g_signalDir     = 0;
    g_signalBarTime = 0;
    g_waitStartTime = 0;
+   g_curValid      = false;
+   g_trendState    = TREND_FLAT;
+   g_trendRangePts = 0;
+   g_trendR2       = 0;
+   g_trendATRRatio = 0;
+   g_trendCalcTime = 0;
 
    // Проверяем, есть ли уже открытая позиция с нашим магиком
    if(HasOpenPosition())
@@ -292,27 +350,31 @@ int OnInit()
    CreateButtons();
    UpdateButtons();
 
-   Print("\n========== ПРОСТОЙ ЗОЛОТО v5.10 ==========");
-   Print("Режим: ", (InpAutoMode ? "АВТО" : "МОНИТОР"));
-   Print("Версия: 5.10 - WAIT валидация + pin-bar вход + динамический RR + 4 фильтра");
-   Print("Фильтры входа:");
-   Print("  1. RSI: ", (InpUseRSI ? "ВКЛ (BUY<40, SELL>60)" : "ВЫКЛ"));
-   Print("  2. ADX: ", (InpUseADX ? "ВКЛ (>20)" : "ВЫКЛ"));
-   Print("  3. MA200: ", (InpUseTrendFilter ? "ВКЛ (фильтр тренда)" : "ВЫКЛ"));
-   Print("  4. Волатильность: ВКЛ (10-100 пт ATR H1)");
-   Print("Дополнительно: RSI-BB=", (InpUseRSIBB ? "ВКЛ" : "ВЫКЛ"), " (TF=", EnumToString(InpRSIBB_RSITF), ")");
-   Print("Вход: pin-bar подтверждение + динамический RR (2.0-3.5)");
-   Print("\n========== ВРЕМЕННЫЕ СЕССИИ (GMT) ==========");
-   Print("Фильтр сессий: ", (InpUseSessionFilter ? "ВКЛ" : "ВЫКЛ"));
-   if(InpUseSessionFilter)
+   if(!g_fastMode)
    {
-      Print("  ASIA (00:00-08:00): ", (InpEnableASIA ? "ВКЛ" : "ВЫКЛ"));
-      Print("  LONDON (08:00-16:00): ", (InpEnableLONDON ? "ВКЛ" : "ВЫКЛ"));
-      Print("  NEWYORK (13:00-21:00): ", (InpEnableNEWYORK ? "ВКЛ" : "ВЫКЛ"));
-      Print("  OVERLAP (13:00-16:00): ", (InpEnableOVERLAP ? "ВКЛ" : "ВЫКЛ"));
-      Print("  Отмена WAIT при выходе из сессии: ", (InpCancelWaitOutSession ? "ВКЛ" : "ВЫКЛ"));
+      Print("\n========== ПРОСТОЙ ЗОЛОТО v5.16 ==========");
+      Print("Режим: ", (InpAutoMode ? "АВТО" : "МОНИТОР"));
+      Print("Версия: 5.16 - WAIT валидация + pin-bar вход + динамический RR + фильтр тренда + производительность");
+      Print("Фильтры входа:");
+      Print("  1. RSI: ", (InpUseRSI ? "ВКЛ" : "ВЫКЛ"));
+      Print("  2. ADX: ", (InpUseADX ? "ВКЛ" : "ВЫКЛ"));
+      Print("  3. MA200: ", (InpUseTrendFilter ? "ВКЛ (фильтр тренда)" : "ВЫКЛ"));
+      Print("  4. Волатильность: ВКЛ (ATR H1)");
+      Print("  5. Направление тренда (регрессия): ", (InpUseTrendDirFilter ? "ВКЛ" : "ВЫКЛ"));
+      Print("Дополнительно: RSI-BB=", (InpUseRSIBB ? "ВКЛ" : "ВЫКЛ"), " (TF=", EnumToString(InpRSIBB_RSITF), ")");
+      Print("Вход: pin-bar подтверждение + динамический RR (2.0-3.5)");
+      Print("\n========== ВРЕМЕННЫЕ СЕССИИ (GMT) ==========");
+      Print("Фильтр сессий: ", (InpUseSessionFilter ? "ВКЛ" : "ВЫКЛ"));
+      if(InpUseSessionFilter)
+      {
+         Print("  ASIA (00:00-08:00): ", (InpEnableASIA ? "ВКЛ" : "ВЫКЛ"));
+         Print("  LONDON (08:00-16:00): ", (InpEnableLONDON ? "ВКЛ" : "ВЫКЛ"));
+         Print("  NEWYORK (13:00-21:00): ", (InpEnableNEWYORK ? "ВКЛ" : "ВЫКЛ"));
+         Print("  OVERLAP (13:00-16:00): ", (InpEnableOVERLAP ? "ВКЛ" : "ВЫКЛ"));
+         Print("  Отмена WAIT при выходе из сессии: ", (InpCancelWaitOutSession ? "ВКЛ" : "ВЫКЛ"));
+      }
+      Print("========================================\n");
    }
-   Print("========================================\n");
    return INIT_SUCCEEDED;
 }
 
@@ -327,6 +389,7 @@ void OnDeinit(const int reason)
    if(m_adxHandle != INVALID_HANDLE) IndicatorRelease(m_adxHandle);
    if(m_maHandle != INVALID_HANDLE) IndicatorRelease(m_maHandle);
    if(m_atrH1Handle != INVALID_HANDLE) IndicatorRelease(m_atrH1Handle);
+   if(m_trendAtrHandle != INVALID_HANDLE) IndicatorRelease(m_trendAtrHandle);
    if(m_rsi2Handle != INVALID_HANDLE) IndicatorRelease(m_rsi2Handle);
    if(m_rsiBBHandle != INVALID_HANDLE)
    {
@@ -359,7 +422,16 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // Обновление данных и визуализации
+   // [REFRESH] Индикаторы читаются ОДИН раз за тик и кэшируются (переиспользуются в UpdatePanel/CheckAutoTrade)
+   g_curValid = (ReadIndicators(g_curUp, g_curMid, g_curLow, g_curAtr, g_curRsi, g_curAdx,
+                                 g_curTouch, g_curDistUp, g_curDistLow) == 0);
+   if(g_curValid)
+   {
+      g_bbUp = g_curUp; g_bbMid = g_curMid; g_bbLow = g_curLow;
+      UpdateTrendState();   // фильтр направления тренда (пересчёт раз в N баров InpTrendTF)
+   }
+
+   // Визуализация/Comment (полностью пропускается в тестере без визуализации и при оптимизации)
    UpdatePanel();
 
    // [TRAILING_STOP] Трейлинг-стоп (фиксация прибыли)
@@ -376,7 +448,7 @@ void OnTick()
       CheckWaitCondition();
 
    // [NEW_ENTRY] Авто-торговля (если разрешена и нет WAIT и нет открытой позиции)
-   if(InpAutoMode && !g_waiting && !HasOpenPosition())
+   if(InpAutoMode && !g_waiting && !HasOpenPosition() && g_curValid)
       CheckAutoTrade();
 }
 
@@ -385,14 +457,15 @@ void OnTick()
 //+------------------------------------------------------------------+
 void UpdatePanel()
 {
-   double up, mid, low, atr, rsi=50, adx=0;
-   int touch;
-   double distUp, distLow;
+   // Гл. оптимизация производительности: в тестере без визуализации (в т.ч. вся генетическая
+   // оптимизация) графика/Comment/алерты полностью пропускаются - на торговую логику не влияет,
+   // т.к. она использует кэш g_cur*, наполненный в OnTick независимо от этой функции.
+   if(g_fastMode || !g_curValid) return;
 
-   if(ReadIndicators(up, mid, low, atr, rsi, adx, touch, distUp, distLow) != 0)
-      return;
-
-   g_bbUp = up; g_bbMid = mid; g_bbLow = low;
+   double up=g_curUp, mid=g_curMid, low=g_curLow, atr=g_curAtr, rsi=g_curRsi, adx=g_curAdx;
+   int    touch   = g_curTouch;
+   double distUp  = g_curDistUp, distLow = g_curDistLow;
+   double point   = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
 
    // --- Визуализация ---
    if(InpShowIndicators)
@@ -407,7 +480,8 @@ void UpdatePanel()
 
    // --- Вывод текстовой информации ---
    string status = g_waiting ? (g_manualWait ? "WAIT (ручная пауза)" : "WAIT (откат)") : "МОНИТОРИНГ";
-   string filters = StringFormat("RSI:%.1f ADX:%.1f RSI-BB:%s", rsi, adx, (InpUseRSIBB ? "ВКЛ" : "ВЫКЛ"));
+   string trendTxt = InpUseTrendDirFilter ? (g_trendState==TREND_BULL?"BULL":(g_trendState==TREND_BEAR?"BEAR":"FLAT")) : "ВЫКЛ";
+   string filters = StringFormat("RSI:%.1f ADX:%.1f RSI-BB:%s TREND:%s", rsi, adx, (InpUseRSIBB ? "ВКЛ" : "ВЫКЛ"), trendTxt);
    string posInfo = (HasOpenPosition() ? StringFormat("ОТКРЫТА (dir=%d)", g_autoDir) : "НЕТ");
    string sigInfo = "";
    if(g_signalArmed && !HasOpenPosition())
@@ -416,13 +490,11 @@ void UpdatePanel()
 
    // Для отображения параметров WAIT (distLine теперь всегда положительный)
    double distLine = 0, waitLevel = 0, waitDistance = 0;
-   double pointNow = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
-   double distMid  = MathAbs(SymbolInfoDouble(m_symbol, SYMBOL_BID) - mid) / pointNow;
-   g_halfChanPts   = (up - low) / 2.0 / pointNow;   // полуширина канала BB (пт)
+   double distMid  = MathAbs(SymbolInfoDouble(m_symbol, SYMBOL_BID) - mid) / point;
+   g_halfChanPts   = (up - low) / 2.0 / point;   // полуширина канала BB (пт)
    if(g_waiting && g_breakLevel != 0)
    {
       double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
-      double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
       distLine = MathAbs(bid - g_breakLevel) / point;   // всегда >= 0
 
       waitLevel = (g_autoDir == 1) ? g_breakLevel + MathMin(InpWaitOffsetPts, (g_bbMid != 0 ? MathAbs(g_bbMid - g_breakLevel)/point : InpWaitOffsetPts)) * point : g_breakLevel - MathMin(InpWaitOffsetPts, (g_bbMid != 0 ? MathAbs(g_bbMid - g_breakLevel)/point : InpWaitOffsetPts)) * point;
@@ -449,25 +521,28 @@ void UpdatePanel()
                            (sigInfo == "" ? "—" : sigInfo),
                            status,
                            filters,
-                           atr, atr*InpATRSLMult/Point(), atr*InpATRSLMult*InpRR/Point(),
+                           atr, atr*InpATRSLMult/point, atr*InpATRSLMult*InpRR/point,
                            posInfo,
                            waitLevel, waitDistance, InpWaitOffsetPts);
    Comment(s);
 
-   // Алерты
-   CheckBoundaryAlert(up, mid, low, SymbolInfoDouble(m_symbol, SYMBOL_BID), Point());
+   // Алерты (только когда есть визуализация - в оптимизации/без-визуал тестере не нужны)
+   CheckBoundaryAlert(up, mid, low, SymbolInfoDouble(m_symbol, SYMBOL_BID), point);
 }
 
 //+------------------------------------------------------------------+
-//| Чтение индикаторов                                               |
+//| Чтение индикаторов (BB читается из готового хэндла m_bbHandle -   |
+//| без ручного пересчёта, это главный источник тормозов в тестере)  |
 //+------------------------------------------------------------------+
 int ReadIndicators(double &up, double &mid, double &low, double &atr,
                    double &rsi, double &adx, int &touch,
                    double &distUp, double &distLow)
 {
    double upA[], midA[], lowA[];
-   if(!ComputeBands(0, 1, upA, midA, lowA))
-      return -1;
+   ArraySetAsSeries(upA, true); ArraySetAsSeries(midA, true); ArraySetAsSeries(lowA, true);
+   if(CopyBuffer(m_bbHandle, 1, 1, 1, upA)  != 1) return -1;   // UPPER_BAND
+   if(CopyBuffer(m_bbHandle, 0, 1, 1, midA) != 1) return -1;   // BASE_LINE
+   if(CopyBuffer(m_bbHandle, 2, 1, 1, lowA) != 1) return -1;   // LOWER_BAND
    up = upA[0]; mid = midA[0]; low = lowA[0];
 
    double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
@@ -504,34 +579,93 @@ int ReadIndicators(double &up, double &mid, double &low, double &atr,
 }
 
 //+------------------------------------------------------------------+
-//| Расчёт полос (ручной)                                            |
+//| Линейная регрессия close[] по индексу бара, возвращает slope/R²   |
 //+------------------------------------------------------------------+
-bool ComputeBands(const int shift, const int count, double &up[], double &midB[], double &lowB[])
+bool LinearRegression(const double &y[], const int n, double &slope, double &r2)
 {
-   int need = shift + count + InpBBPeriod + 2;
-   double cl[];
-   ArraySetAsSeries(cl, true);
-   if(CopyClose(m_symbol, InpMainTF, 0, need, cl) < need)
-      return false;
-   ArrayResize(up, count); ArrayResize(midB, count); ArrayResize(lowB, count);
-   for(int i = shift; i < shift + count; i++)
+   if(n < 2) return false;
+   double sumX=0, sumY=0, sumXY=0, sumX2=0, sumY2=0;
+   for(int i = 0; i < n; i++)
    {
-      double sum = 0;
-      for(int j = i; j < i + InpBBPeriod; j++) sum += cl[j];
-      double ma = sum / InpBBPeriod;
-      double var = 0;
-      for(int j = i; j < i + InpBBPeriod; j++)
-      {
-         double d = cl[j] - ma;
-         var += d * d;
-      }
-      double sd = MathSqrt(var / InpBBPeriod);
-      int k = i - shift;
-      midB[k] = ma;
-      up[k] = ma + InpBBDev * sd;
-      lowB[k] = ma - InpBBDev * sd;
+      // y[] приходит в виде "series" (y[0] - самый новый бар) => x растёт со временем
+      double x = (double)(n - 1 - i);
+      double yy = y[i];
+      sumX  += x;  sumY  += yy;
+      sumXY += x*yy; sumX2 += x*x; sumY2 += yy*yy;
+   }
+   double denom = n*sumX2 - sumX*sumX;
+   if(denom == 0) return false;
+   slope = (n*sumXY - sumX*sumY) / denom;
+
+   double corrDenom = MathSqrt(MathAbs((n*sumX2 - sumX*sumX) * (n*sumY2 - sumY*sumY)));
+   r2 = 0;
+   if(corrDenom != 0)
+   {
+      double corr = (n*sumXY - sumX*sumY) / corrDenom;
+      r2 = corr*corr;
    }
    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Направленный фильтр тренда: линейная регрессия по closes на       |
+//| InpTrendTF за окно InpTrendWindow. BULL/BEAR требует минимального  |
+//| смещения линии (в ATR) и минимального качества R² - иначе FLAT.   |
+//| Пересчитывается не каждый тик, а раз в InpTrendRecalcBars баров.  |
+//+------------------------------------------------------------------+
+void UpdateTrendState()
+{
+   if(!InpUseTrendDirFilter) { g_trendState = TREND_FLAT; return; }
+
+   datetime barTime = iTime(m_symbol, InpTrendTF, 0);
+   if(barTime == 0) return;
+
+   if(g_trendCalcTime != 0)
+   {
+      int periodSec = PeriodSeconds(InpTrendTF);
+      if(periodSec > 0 && (int)((barTime - g_trendCalcTime) / periodSec) < InpTrendRecalcBars)
+         return;   // ещё не время пересчитывать
+   }
+   g_trendCalcTime = barTime;
+
+   int n = InpTrendWindow;
+   if(n < 2) return;
+   double cl[];
+   ArraySetAsSeries(cl, true);
+   if(CopyClose(m_symbol, InpTrendTF, 1, n, cl) < n)
+      return;
+
+   double slope=0, r2=0;
+   if(!LinearRegression(cl, n, slope, r2))
+      return;
+
+   double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+   double rangePts = slope * (n - 1) / point;   // суммарное движение линии регрессии за окно, в пт
+
+   double atrVal = 0;
+   double atrArr[];
+   ArraySetAsSeries(atrArr, true);
+   if(m_trendAtrHandle != INVALID_HANDLE && CopyBuffer(m_trendAtrHandle, 0, 1, 1, atrArr) == 1)
+      atrVal = atrArr[0];
+   double atrPts = (atrVal > 0 ? atrVal / point : 0);
+
+   g_trendRangePts = rangePts;
+   g_trendR2       = r2;
+   g_trendATRRatio = (atrPts > 0 ? rangePts / atrPts : 0);
+
+   bool strongEnough = (r2 >= InpTrendMinR2) && (MathAbs(g_trendATRRatio) >= InpTrendMinSlopeATR);
+   g_trendState = (!strongEnough ? TREND_FLAT : (rangePts > 0 ? TREND_BULL : TREND_BEAR));
+}
+
+//+------------------------------------------------------------------+
+//| Разрешает ли текущий тренд вход в данном направлении               |
+//| BULL -> только BUY, BEAR -> только SELL, FLAT -> блок всех входов |
+//+------------------------------------------------------------------+
+bool TrendDirAllows(const ENUM_ORDER_TYPE type)
+{
+   if(!InpUseTrendDirFilter) return true;
+   if(g_trendState == TREND_FLAT) return false;
+   return (type == ORDER_TYPE_BUY) ? (g_trendState == TREND_BULL) : (g_trendState == TREND_BEAR);
 }
 
 //+------------------------------------------------------------------+
@@ -585,7 +719,8 @@ double CalculateDynamicRR()
 
    double dynamicRR = 2.0 + volFactor;  // RR от 2.0 до 3.5
 
-   Print("[DYNAMIC_RR] ATR H1=", atrPts, " пт, RR=", DoubleToString(dynamicRR, 2));
+   if(!g_fastMode)
+      Print("[DYNAMIC_RR] ATR H1=", atrPts, " пт, RR=", DoubleToString(dynamicRR, 2));
    return dynamicRR;
 }
 
@@ -599,14 +734,14 @@ bool OpenAutoTrade(const ENUM_ORDER_TYPE type, const bool bypassFilters = false)
    if(!InpAutoMode) return false;
    if(HasOpenPosition())
    {
-      Print("Уже есть открытая позиция, новую не открываем");
+      if(!g_fastMode) Print("Уже есть открытая позиция, новую не открываем");
       return false;
    }
 
    // Проверка фильтров (реверс после убытка их игнорирует)
    if(!bypassFilters && (!PassFilters(type) || !PassRSIBBFilter(type)))
    {
-      Print("Фильтры не пропускают сигнал ", EnumToString(type));
+      if(!g_fastMode) Print("Фильтры не пропускают сигнал ", EnumToString(type));
       return false;
    }
 
@@ -618,7 +753,7 @@ bool OpenAutoTrade(const ENUM_ORDER_TYPE type, const bool bypassFilters = false)
    ArraySetAsSeries(atrArr, true);
    if(CopyBuffer(m_atrHandle, 0, 1, 1, atrArr) != 1)
    {
-      Print("Ошибка чтения ATR");
+      if(!g_fastMode) Print("Ошибка чтения ATR");
       return false;
    }
    double atrVal = atrArr[0];
@@ -633,7 +768,8 @@ bool OpenAutoTrade(const ENUM_ORDER_TYPE type, const bool bypassFilters = false)
    const double MIN_RR = 1.5;
    if(dynamicRR < MIN_RR)
    {
-      Print("[ENTRY_REJECT] RR =", DoubleToString(dynamicRR, 2), " < MinRR=", DoubleToString(MIN_RR, 2), ". Входит невыгоден.");
+      if(!g_fastMode)
+         Print("[ENTRY_REJECT] RR =", DoubleToString(dynamicRR, 2), " < MinRR=", DoubleToString(MIN_RR, 2), ". Входит невыгоден.");
       return false;
    }
    
@@ -652,7 +788,7 @@ bool OpenAutoTrade(const ENUM_ORDER_TYPE type, const bool bypassFilters = false)
    double stopLv = (double)SymbolInfoInteger(m_symbol, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(m_symbol, SYMBOL_POINT);
    if(MathAbs(sl - bid) < stopLv || MathAbs(tp - bid) < stopLv)
    {
-      Print("SL/TP слишком близко к цене");
+      if(!g_fastMode) Print("SL/TP слишком близко к цене");
       return false;
    }
 
@@ -677,13 +813,14 @@ bool OpenAutoTrade(const ENUM_ORDER_TYPE type, const bool bypassFilters = false)
          g_breakLevel = g_bbUp;
       g_chanWidth = g_bbUp - g_bbLow;  // не используется, но оставим
 
-      Print("Открыта авто-сделка ", EnumToString(type), " лот=", lot,
-            " SL=", DoubleToString(sl, digits), " TP=", DoubleToString(tp, digits));
+      if(!g_fastMode)
+         Print("Открыта авто-сделка ", EnumToString(type), " лот=", lot,
+               " SL=", DoubleToString(sl, digits), " TP=", DoubleToString(tp, digits));
       return true;
    }
    else
    {
-      Print("Ошибка открытия: ", m_trade.ResultRetcode(), " ", m_trade.ResultRetcodeDescription());
+      if(!g_fastMode) Print("Ошибка открытия: ", m_trade.ResultRetcode(), " ", m_trade.ResultRetcodeDescription());
       return false;
    }
 }
@@ -728,6 +865,11 @@ bool PassFilters(const ENUM_ORDER_TYPE type)
       if(price > ma[0] && type == ORDER_TYPE_SELL) return false;  // выше MA – не продаём
       if(price < ma[0] && type == ORDER_TYPE_BUY)  return false;  // ниже MA – не покупаем
    }
+
+   // Направленный фильтр тренда (линейная регрессия, отдельные окно/ТФ): BULL->только BUY,
+   // BEAR->только SELL, FLAT->блок обоих направлений
+   if(InpUseTrendDirFilter && !TrendDirAllows(type))
+      return false;
 
    return true;
 }
@@ -855,7 +997,7 @@ bool CheckVolatilityFilter()
    double atrH1[];
    ArraySetAsSeries(atrH1, true);
    if(CopyBuffer(m_atrH1Handle, 0, 1, 1, atrH1) != 1)
-      return false;  // Нет данных, разрешаем вход
+      return true;  // Нет данных (временная ошибка чтения) - разрешаем вход, не блокируем
 
    double atr = atrH1[0];
    double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
@@ -868,12 +1010,14 @@ bool CheckVolatilityFilter()
 
    if(atrPts < MIN_VOLATILITY_PTS)
    {
-      Print("[VOLATILITY] Слишком низкая волатильность (ATR H1 = ", atrPts, " пт < ", MIN_VOLATILITY_PTS, "). Пропускаем.");
+      if(!g_fastMode)
+         Print("[VOLATILITY] Слишком низкая волатильность (ATR H1 = ", atrPts, " пт < ", MIN_VOLATILITY_PTS, "). Пропускаем.");
       return false;
    }
    if(atrPts > MAX_VOLATILITY_PTS)
    {
-      Print("[VOLATILITY] Слишком высокая волатильность (ATR H1 = ", atrPts, " пт > ", MAX_VOLATILITY_PTS, "). Пропускаем.");
+      if(!g_fastMode)
+         Print("[VOLATILITY] Слишком высокая волатильность (ATR H1 = ", atrPts, " пт > ", MAX_VOLATILITY_PTS, "). Пропускаем.");
       return false;
    }
    return true;
@@ -884,20 +1028,16 @@ bool CheckVolatilityFilter()
 //+------------------------------------------------------------------+
 //+------------------------------------------------------------------+
 //| Автоматическая проверка на вход с pin-bar подтверждением         |
-//| Логика: 1) Касание BB -> вооружение сигнала                        |
+//| Логика: 1) Касание BB -> вооружение сигнала (с учётом тренда)      |
 //|         2) Проверка фильтров (RSI, ADX, MA200, волатильность)      |
 //|         3) Ожидание pin-bar подтверждения на M1                    |
 //|         4) Открытие с динамическим RR (2.0-3.5)                   |
 //+------------------------------------------------------------------+
 void CheckAutoTrade()
 {
-   double up, mid, low, atr, rsi, adx;
-   int touch;
-   double distUp, distLow;
-   if(ReadIndicators(up, mid, low, atr, rsi, adx, touch, distUp, distLow) != 0)
-      return;
+   int touch = g_curTouch;   // индикаторы уже прочитаны один раз за тик в OnTick
 
-   // [ENTRY_FILTER_1] Проверяем фильтр волатильности (ATR H1: 10-100 пт)
+   // [ENTRY_FILTER_1] Проверяем фильтр волатильности (ATR H1)
    if(!CheckVolatilityFilter())
       return;
 
@@ -914,35 +1054,35 @@ void CheckAutoTrade()
       CopyClose(m_symbol, PERIOD_M1, 1, 1, c1) != 1)
       return;
 
-   // 1) Касание полосы BB – только фиксируем ожидающий сигнал
-   if(touch == 1 && InpAllowBuy && !g_signalArmed)
+   // 1) Касание полосы BB – фиксируем ожидающий сигнал, только если тренд не блокирует направление
+   if(touch == 1 && InpAllowBuy && !g_signalArmed && TrendDirAllows(ORDER_TYPE_BUY))
    {
       g_signalArmed   = true;
       g_signalDir     = 1;
       g_signalBarTime = t1;
-      Print("[SIGNAL] BUY: касание нижней полосы BB, ждём пин-бар на M1");
+      if(!g_fastMode) Print("[SIGNAL] BUY: касание нижней полосы BB, ждём пин-бар на M1");
    }
-   else if(touch == -1 && InpAllowSell && !g_signalArmed)
+   else if(touch == -1 && InpAllowSell && !g_signalArmed && TrendDirAllows(ORDER_TYPE_SELL))
    {
       g_signalArmed   = true;
       g_signalDir     = -1;
       g_signalBarTime = t1;
-      Print("[SIGNAL] SELL: касание верхней полосы BB, ждём пин-бар на M1");
+      if(!g_fastMode) Print("[SIGNAL] SELL: касание верхней полосы BB, ждём пин-бар на M1");
    }
 
    if(!g_signalArmed || g_signalDir == 0)
       return;
 
-   // 2) Выздывать до пин-бара на M1:
-   if(g_signalDir == 1 && CheckPinBarConfirm(1))  // BUY и пин-бар сформировался
+   // 2) Ждём пин-бар на M1 (и повторно проверяем тренд - он мог смениться, пока ждали):
+   if(g_signalDir == 1 && CheckPinBarConfirm(1) && TrendDirAllows(ORDER_TYPE_BUY))  // BUY и пин-бар сформировался
    {
-      if(OpenAutoTrade(ORDER_TYPE_BUY))
+      if(OpenAutoTrade(ORDER_TYPE_BUY) && !g_fastMode)
          Print("[ENTRY] Авто-вход BUY афтер пин-бар M1");
       ClearSignal();
    }
-   else if(g_signalDir == -1 && CheckPinBarConfirm(-1))  // SELL и пин-бар сформировался
+   else if(g_signalDir == -1 && CheckPinBarConfirm(-1) && TrendDirAllows(ORDER_TYPE_SELL))  // SELL и пин-бар сформировался
    {
-      if(OpenAutoTrade(ORDER_TYPE_SELL))
+      if(OpenAutoTrade(ORDER_TYPE_SELL) && !g_fastMode)
          Print("[ENTRY] Авто-вход SELL афтер пин-бар M1");
       ClearSignal();
    }
@@ -951,7 +1091,7 @@ void CheckAutoTrade()
    if(InpConfirmMaxBars > 0 && g_signalBarTime != 0 &&
       t1 - g_signalBarTime >= InpConfirmMaxBars * 60)
    {
-      Print("[SIGNAL] Отмена: пин-бар не появился за ", InpConfirmMaxBars, " бар(ов) M1");
+      if(!g_fastMode) Print("[SIGNAL] Отмена: пин-бар не появился за ", InpConfirmMaxBars, " бар(ов) M1");
       ClearSignal();
    }
 }
@@ -1011,7 +1151,7 @@ void CheckTrailingStop()
 
    newSL = NormalizeDouble(newSL, digits);
    m_trade.PositionModify(g_autoPosTicket, newSL, PositionGetDouble(POSITION_TP));
-   if(m_trade.ResultRetcode() == TRADE_RETCODE_DONE)
+   if(m_trade.ResultRetcode() == TRADE_RETCODE_DONE && !g_fastMode)
       Print("Трейлинг: SL перенесён на ", DoubleToString(newSL, digits),
             " (прибыль ", DoubleToString(profitPts, 1), " пт)");
 }
@@ -1051,7 +1191,7 @@ void CheckPositionClose()
 
    if(!gotResult)
    {
-      Print("Не удалось получить результат закрытой позиции, сбрасываем состояние");
+      if(!g_fastMode) Print("Не удалось получить результат закрытой позиции, сбрасываем состояние");
       g_autoDir = 0;
       g_waiting = false;
       g_breakLevel = 0;
@@ -1061,7 +1201,7 @@ void CheckPositionClose()
 
    if(totalProfit >= 0)
    {
-      Print("Авто-сделка закрыта с прибылью: ", DoubleToString(totalProfit, 2), ". Остаёмся в режиме MONITOR.");
+      if(!g_fastMode) Print("Авто-сделка закрыта с прибылью: ", DoubleToString(totalProfit, 2), ". Остаёмся в режиме MONITOR.");
       g_autoDir = 0;
       g_breakLevel = 0;
       g_reverseDone = false;     // новая серия - реверс снова доступен
@@ -1071,7 +1211,7 @@ void CheckPositionClose()
    }
    else
    {
-      Print("Авто-сделка закрыта с убытком: ", DoubleToString(totalProfit, 2), ".");
+      if(!g_fastMode) Print("Авто-сделка закрыта с убытком: ", DoubleToString(totalProfit, 2), ".");
 
       if(InpReverseOnLoss && !g_reverseDone)
       {
@@ -1079,13 +1219,13 @@ void CheckPositionClose()
          g_reverseDone = true;   // реверс расходуется независимо от результата открытия
          if(OpenAutoTrade(revType, true))
          {
-            Print("Реверс: открыта встречная позиция ", EnumToString(revType));
+            if(!g_fastMode) Print("Реверс: открыта встречная позиция ", EnumToString(revType));
             return;
          }
-         Print("Реверс не удался, переходим в WAIT");
+         if(!g_fastMode) Print("Реверс не удался, переходим в WAIT");
       }
 
-      Print("Переходим в режим WAIT, ждём откат к средней.");
+      if(!g_fastMode) Print("Переходим в режим WAIT, ждём откат к средней.");
       g_waiting = true;
       g_waitStartTime = iTime(m_symbol, PERIOD_M1, 0);   // старт таймаута WAIT
       // g_breakLevel уже запомнен при открытии
@@ -1101,7 +1241,7 @@ void ValidateWaitState()
    if(g_waiting && HasOpenPosition())
    {
       // Позиция открыта но мы в WAIT - это ошибка, выходим
-      Print("[WARN] Позиция открыта но g_waiting=true. Сбрасываем WAIT.");
+      if(!g_fastMode) Print("[WARN] Позиция открыта но g_waiting=true. Сбрасываем WAIT.");
       g_waiting = false;
       g_waitStartTime = 0;
       return;
@@ -1113,7 +1253,7 @@ void ValidateWaitState()
       // Если g_autoDir невалиден, выходим из WAIT
       if(g_autoDir != 1 && g_autoDir != -1)
       {
-         Print("[WARN] g_autoDir невалиден (", g_autoDir, "). Сбрасываем WAIT.");
+         if(!g_fastMode) Print("[WARN] g_autoDir невалиден (", g_autoDir, "). Сбрасываем WAIT.");
          g_waiting = false;
          g_breakLevel = 0;
          g_waitStartTime = 0;
@@ -1124,7 +1264,7 @@ void ValidateWaitState()
       // Если g_breakLevel == 0, выходим из WAIT
       if(g_breakLevel == 0)
       {
-         Print("[WARN] g_breakLevel == 0 в авто-WAIT. Сбрасываем WAIT.");
+         if(!g_fastMode) Print("[WARN] g_breakLevel == 0 в авто-WAIT. Сбрасываем WAIT.");
          g_waiting = false;
          g_autoDir = 0;
          g_waitStartTime = 0;
@@ -1138,7 +1278,7 @@ void ValidateWaitState()
          datetime nowBar = iTime(m_symbol, PERIOD_M1, 0);
          if(nowBar - g_waitStartTime >= 86400)  // 24 часа = 86400 секунд
          {
-            Print("[WARN] WAIT длится > 24 часов. Принудительный выход в MONITOR.");
+            if(!g_fastMode) Print("[WARN] WAIT длится > 24 часов. Принудительный выход в MONITOR.");
             g_waiting = false;
             g_breakLevel = 0;
             g_autoDir = 0;
@@ -1153,7 +1293,7 @@ void ValidateWaitState()
    // Если в ручном режиме но открыта позиция - выходим из ручного WAIT
    if(g_waiting && g_manualWait && HasOpenPosition())
    {
-      Print("[WARN] В ручном WAIT открыта позиция. Сбрасываем режим паузы.");
+      if(!g_fastMode) Print("[WARN] В ручном WAIT открыта позиция. Сбрасываем режим паузы.");
       g_manualWait = false;
       g_waiting = false;
       ClearSignal();
@@ -1179,7 +1319,7 @@ void CheckWaitCondition()
    // [SESSION] Проверяем выход из активной сессии - отмена WAIT
    if(InpCancelWaitOutSession && InpUseSessionFilter && !IsTimeInSession())
    {
-      Print("[SESSION] Выход из активной сессии. Отмена WAIT режима.");
+      if(!g_fastMode) Print("[SESSION] Выход из активной сессии. Отмена WAIT режима.");
       g_waiting = false;
       g_breakLevel = 0;
       g_autoDir = 0;
@@ -1192,7 +1332,7 @@ void CheckWaitCondition()
    // Авто-WAIT: проверяем откат и таймаут
    if(g_breakLevel == 0 || (g_autoDir != 1 && g_autoDir != -1))
    {
-      Print("[DEBUG] Exit WAIT: invalid state (breakLevel=" , g_breakLevel, ", autoDir=", g_autoDir, ")");
+      if(!g_fastMode) Print("[DEBUG] Exit WAIT: invalid state (breakLevel=" , g_breakLevel, ", autoDir=", g_autoDir, ")");
       g_waiting = false;
       g_breakLevel = 0;
       g_autoDir = 0;
@@ -1217,9 +1357,10 @@ void CheckWaitCondition()
 
    if(waitComplete)
    {
-      Print("[INFO] Откат достигнут: bid=", DoubleToString(bid, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS)),
-            ", waitLevel=", DoubleToString(waitLevel, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS)),
-            ". Выходим из WAIT в MONITOR.");
+      if(!g_fastMode)
+         Print("[INFO] Откат достигнут: bid=", DoubleToString(bid, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS)),
+               ", waitLevel=", DoubleToString(waitLevel, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS)),
+               ". Выходим из WAIT в MONITOR.");
       g_waiting = false;
       g_breakLevel = 0;
       g_autoDir = 0;
@@ -1236,8 +1377,9 @@ void CheckWaitCondition()
       // Проверяем в секундах (не bar-bar)
       if(nowBar - g_waitStartTime >= (datetime)InpWaitMaxBars * 60)
       {
-         Print("[INFO] WAIT сброшен по таймауту: откат не произошёл за ", InpWaitMaxBars,
-               " свечей M1. Возвращаемся в MONITOR.");
+         if(!g_fastMode)
+            Print("[INFO] WAIT сброшен по таймауту: откат не произошёл за ", InpWaitMaxBars,
+                  " свечей M1. Возвращаемся в MONITOR.");
          g_waiting = false;
          g_breakLevel = 0;
          g_autoDir = 0;
@@ -1332,7 +1474,10 @@ void DrawSegment(const string name, const color clr, const datetime &tm[], const
 void DrawBands(const int n)
 {
    double upA[], midA[], lowA[];
-   if(!ComputeBands(0, n, upA, midA, lowA)) return;
+   ArraySetAsSeries(upA, true); ArraySetAsSeries(midA, true); ArraySetAsSeries(lowA, true);
+   if(CopyBuffer(m_bbHandle, 1, 0, n, upA)  < n) return;
+   if(CopyBuffer(m_bbHandle, 0, 0, n, midA) < n) return;
+   if(CopyBuffer(m_bbHandle, 2, 0, n, lowA) < n) return;
    datetime tm[];
    ArraySetAsSeries(tm, true);
    if(CopyTime(m_symbol, InpMainTF, 0, n, tm) < n) return;
@@ -1484,7 +1629,7 @@ void DrawFilterPanel()
       ObjectSetInteger(0, "SG_flt_bg", OBJPROP_CORNER, corner);
       ObjectSetInteger(0, "SG_flt_bg", OBJPROP_YDISTANCE, 8);
       ObjectSetInteger(0, "SG_flt_bg", OBJPROP_XSIZE, 270);
-      ObjectSetInteger(0, "SG_flt_bg", OBJPROP_YSIZE, 142);
+      ObjectSetInteger(0, "SG_flt_bg", OBJPROP_YSIZE, 168);
       ObjectSetInteger(0, "SG_flt_bg", OBJPROP_BGCOLOR, C'45,45,50');
       ObjectSetInteger(0, "SG_flt_bg", OBJPROP_BORDER_COLOR, C'90,90,90');
       ObjectSetInteger(0, "SG_flt_bg", OBJPROP_BORDER_TYPE, BORDER_FLAT);
@@ -1507,7 +1652,7 @@ void DrawFilterPanel()
    int digits = (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS);
 
    // Заголовок
-   SetFilterLabel("SG_flt_hdr", 116, "=== ФИЛЬТРЫ ===", clrWhite, 10);
+   SetFilterLabel("SG_flt_hdr", 142, "=== ФИЛЬТРЫ ===", clrWhite, 10);
 
    // --- RSI ---
    string rsiTxt = StringFormat("RSI(%d) [%s]  %.1f  (OS %.0f / OB %.0f)",
@@ -1516,7 +1661,7 @@ void DrawFilterPanel()
    color rsiClr = clrGray;
    if(InpUseRSI)
       rsiClr = (rsi < InpRSIOversold || rsi > InpRSIOverbought) ? clrRed : clrLime;
-   SetFilterLabel("SG_flt_rsi", 70, rsiTxt, rsiClr);
+   SetFilterLabel("SG_flt_rsi", 94, rsiTxt, rsiClr);
 
    // --- ADX ---
    string adxTxt = StringFormat("ADX(%d) [%s]  %.1f  (>= %.0f)",
@@ -1524,7 +1669,7 @@ void DrawFilterPanel()
    color adxClr = clrGray;
    if(InpUseADX)
       adxClr = (adx >= InpADXMin) ? clrLime : clrRed;
-   SetFilterLabel("SG_flt_adx", 46, adxTxt, adxClr);
+   SetFilterLabel("SG_flt_adx", 70, adxTxt, adxClr);
 
    // --- Трендовый фильтр (MA) ---
    string maTxt = StringFormat("TREND(%d) [%s]  %s %s MA %s",
@@ -1535,7 +1680,19 @@ void DrawFilterPanel()
    color maClr = clrGray;
    if(InpUseTrendFilter)
       maClr = (price > ma) ? clrLime : clrOrange;
-   SetFilterLabel("SG_flt_tr", 22, maTxt, maClr);
+   SetFilterLabel("SG_flt_tr", 46, maTxt, maClr);
+
+   // --- Направленный фильтр тренда (линейная регрессия, отдельный ТФ/окно) ---
+   string trendTxt = "TREND-DIR: ВЫКЛ";
+   color trendClr = clrGray;
+   if(InpUseTrendDirFilter)
+   {
+      string st = (g_trendState==TREND_BULL?"BULL":(g_trendState==TREND_BEAR?"BEAR":"FLAT"));
+      trendTxt = StringFormat("TREND-DIR(%s,%d) %s  R\u00b2=%.2f ATR\u00d7%.2f",
+                              EnumToString(InpTrendTF), InpTrendWindow, st, g_trendR2, g_trendATRRatio);
+      trendClr = (g_trendState==TREND_BULL ? clrLime : (g_trendState==TREND_BEAR ? clrRed : clrOrange));
+   }
+   SetFilterLabel("SG_flt_trend2", 22, trendTxt, trendClr);
 
    // --- Фильтр BB по RSI (прямой расчёт через свой RSI) ---
    string rbbTxt = "RSI-BB: ВЫКЛ";
@@ -1573,7 +1730,7 @@ void DrawFilterPanel()
       else
          rbbTxt = "RSI-BB: нет данных";
    }
-   SetFilterLabel("SG_flt_rbb", 92, rbbTxt, rbbClr);
+   SetFilterLabel("SG_flt_rbb", 118, rbbTxt, rbbClr);
 }
 
 //+------------------------------------------------------------------+
@@ -1586,6 +1743,7 @@ void DeleteFilterPanelObjects()
    ObjectDelete(0, "SG_flt_rsi");
    ObjectDelete(0, "SG_flt_adx");
    ObjectDelete(0, "SG_flt_tr");
+   ObjectDelete(0, "SG_flt_trend2");
    ObjectDelete(0, "SG_flt_rbb");
 }
 
