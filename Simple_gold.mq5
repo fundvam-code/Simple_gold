@@ -1,7 +1,7 @@
 //+------------------------------------------------------------------+
 //|                                                  Simple_gold_v5.mq5 |
 //|                                      Copyright 2026, Bondarev A.   |
-//|  v5.14: ОПТИМИЗИРОВАННАЯ (МАКСИМУМ ВХОДОВ) - база для оптимизации|
+//|  v5.15: ОПТИМИЗИРОВАННАЯ + исправлена волатильность для XAUUSD |
 //+------------------------------------------------------------------+
 //| ОСНОВНЫЕ УЛУЧШЕНИЯ v5.14 (КОНФИГ для МАКСИМУМА ВХОДОВ - база оптимизации):                                          |
 //|                                                                    |
@@ -61,8 +61,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Bondarev A."
 #property link      "https://www.mql5.com"
-#property version   "5.14"
-#property description "XAUUSD: WAIT + pin-bar + RR + фильтры + сессии GMT (конфиг 5.14: максимум входов для оптимизации)"
+#property version   "5.15"
+#property description "XAUUSD: WAIT + pin-bar + RR + фильтры + сессии GMT (v5.15: исправлена волатильность для XAUUSD 50-2000 пт)"
 
 #include <Trade\Trade.mqh>
 
@@ -567,13 +567,14 @@ double CalculateDynamicRR()
    double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
    double atrPts = atr / point;
 
-   // Диапазон волатильности (расширенный для максимума входов: 5-150 пт)
-   const double MIN_VOLATILITY_PTS = 5.0;
-   const double MAX_VOLATILITY_PTS = 150.0;
+   // Диапазон волатильности для XAUUSD: 50-2000 пт (в денежных единицах / point)
+   // ATR часто 200-1500 пт - это НОРМАЛЬНО для золота!
+   const double MIN_VOLATILITY_PTS = 50.0;   // Минимум движения
+   const double MAX_VOLATILITY_PTS = 2000.0; // Максимум (выше = хаос)
 
    // Динамический RR: базовый 2.0 + волатильность фактор (от 0 до 1.5)
-   // Когда ATR низкий: RR = 2.0
-   // Когда ATR высокий: RR = 3.5
+   // Когда ATR низкий (50 пт): RR = 2.0
+   // Когда ATR высокий (2000 пт): RR = 3.5
    double volFactor = 0.0;
    if(atrPts >= MAX_VOLATILITY_PTS)
       volFactor = 1.5;  // Максимум
@@ -860,9 +861,10 @@ bool CheckVolatilityFilter()
    double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
    double atrPts = atr / point;
 
-   // Волатильность: расширенный диапазон 5-150 пт (для максимума входов)
-   const double MIN_VOLATILITY_PTS = 5.0;
-   const double MAX_VOLATILITY_PTS = 150.0;
+   // Волатильность для XAUUSD: 50-2000 пт (в денежных единицах / point)
+   // Типичный диапазон: 200-1500 пт за час - это НОРМАЛЬНО!
+   const double MIN_VOLATILITY_PTS = 50.0;   // Слишком тихое движение
+   const double MAX_VOLATILITY_PTS = 2000.0; // Слишком хаотичное
 
    if(atrPts < MIN_VOLATILITY_PTS)
    {
