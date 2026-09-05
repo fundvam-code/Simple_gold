@@ -164,7 +164,9 @@ input bool              InpAlertPush     = true;          // Push-нотифик
 input group "=== Фильтр тренда (направление входов по окну) ==="
 input bool              InpUseTrendDirFilter = false;      // Гл. выключатель: BUY только в BULL, SELL только в BEAR, FLAT - блок входов
 input ENUM_TIMEFRAMES   InpTrendTF           = PERIOD_H1;  // Таймфрейм для определения тренда (независим от InpMainTF)
-input int               InpTrendWindow       = 50;         // Окно линейной регрессии (кол-во баров InpTrendTF)
+
+input group "=== Линейная регрессия (параметры расчёта тренда) ==="
+input int               InpTrendWindow       = 50;         // Окно регрессии (кол-во баров InpTrendTF)
 input int               InpTrendATRPeriod    = 14;         // Период ATR (для нормализации силы тренда)
 input double            InpTrendMinSlopeATR  = 1.0;        // Мин. смещение линии регрессии за окно (в ATR), иначе FLAT
 input double            InpTrendMinR2        = 0.5;        // Мин. качество тренда R² (0..1): 1=идеальная линия, 0=шум
