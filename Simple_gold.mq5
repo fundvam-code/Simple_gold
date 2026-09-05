@@ -1,14 +1,21 @@
 //+------------------------------------------------------------------+
 //|                                                  Simple_gold_v5.mq5 |
 //|                                      Copyright 2026, Bondarev A.   |
-//|  Версия с исправленным distLine (всегда положительный)           |
+//|  v5.09: вход после бычьей свечи M1 + таймаут WAIT по свечам       |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Bondarev A."
 #property link      "https://www.mql5.com"
-#property version   "5.05"
-#property description "Торговля по BB с фильтрами и логикой WAIT (визуализация)."
+#property version   "5.09"
+#property description "Торговля по BB: вход после первой бычьей свечи M1, таймаут WAIT, фильтры, логика WAIT."
 
 #include <Trade\Trade.mqh>
+
+//-------------------- Режим фильтра BB по RSI -----------------------+
+enum ENUM_RSIBB_MODE
+{
+   RSIBB_MODE_EXTREME = 0,  // Экстремум: BUY при RSI<нижняя полоса, SELL при RSI>верхняя
+   RSIBB_MODE_INSIDE  = 1   // Запрет экстремума: BUY пока RSI<верхняя, SELL пока RSI>нижняя
+};
 
 //-------------------- Входные параметры -----------------------------+
 input group "=== Базовые настройки ==="
@@ -24,9 +31,14 @@ input bool              InpAutoMode      = true;          // true = авто, fa
 input double            InpBBOffsetPts   = 0.0;           // Смещение касания (пт)
 input bool              InpAllowBuy      = true;          // Разрешить покупки
 input bool              InpAllowSell     = true;          // Разрешить продажи
+input int               InpConfirmMaxBars = 10;           // Окно ожидания подтверждения: макс. свечей M1 (0 = без лимита)
 
 input group "=== Логика отката (WAIT) ==="
 input double            InpWaitOffsetPts  = 50.0;         // Отход от линии (пт) для выхода из WAIT
+input int               InpWaitMaxBars    = 0;            // Сброс WAIT: нет отката за N свечей M1 (0 = без лимита)
+
+input group "=== Реверс после убытка ==="
+input bool              InpReverseOnLoss  = false;        // Один раз открыть встречную позицию после убытка
 
 input group "=== Трейлинг-стоп (фиксация прибыли) ==="
 input bool              InpTrailEnable     = true;         // Включить трейлинг-стоп
@@ -53,6 +65,16 @@ input bool              InpUseTrendFilter= false;
 input int               InpMATrendPeriod = 200;
 input ENUM_MA_METHOD    InpMAMethod      = MODE_SMA;
 
+input group "=== Фильтр BB по RSI (динамические уровни) ==="
+input bool               InpUseRSIBB          = false;        // Включить фильтр BB по RSI
+input ENUM_TIMEFRAMES    InpRSIBB_RSITF       = PERIOD_H1;    // Таймфрейм для расчёта RSI
+input int                InpRSIBB_RSIPeriod   = 14;           // Период RSI
+input ENUM_APPLIED_PRICE InpRSIBB_RsiApplied  = PRICE_CLOSE;  // Применяемая цена для RSI
+input int                InpRSIBB_BBPeriod    = 20;           // Период BB (по RSI)
+input double             InpRSIBB_BBDev       = 2.0;          // Отклонение BB
+input ENUM_RSIBB_MODE    InpRSIBB_Mode        = RSIBB_MODE_EXTREME; // Режим фильтра
+input double             InpRSIBB_Tolerance   = 0.0;          // Допуск от полосы (ед. RSI)
+
 input group "=== Алерты ==="
 input bool              InpAlertEnable   = true;
 input double            InpAlertTriggerPts = 50.0;
@@ -68,12 +90,16 @@ input bool              InpShowIndicators = true;   // Показывать BB �
 CTrade               m_trade;
 string               m_symbol;
 int                  m_bbHandle, m_atrHandle, m_rsiHandle, m_adxHandle;
+int                  m_maHandle;       // трендовый фильтр (MA)
 int                  m_atrH1Handle;    // для отображения
+int                  m_rsiBBHandle;    // индикатор SG_RSI_BB (только график)
+int                  m_rsi2Handle;     // RSI на своём ТФ (для фильтра BB по RSI, напрямую)
 
 ulong                g_autoPosTicket = 0;
 int                  g_autoDir       = 0;       // +1 buy, -1 sell
 bool                 g_waiting       = false;   // true – режим WAIT
 bool                 g_manualWait    = false;   // true – ручная пауза (кнопка WAIT)
+bool                 g_reverseDone   = false;   // реверс для текущей убыточной серии уже выполнен
 double               g_breakLevel    = 0.0;
 double               g_chanWidth     = 0.0;
 double               g_bbUp, g_bbMid, g_bbLow;  // текущие полосы
@@ -82,6 +108,10 @@ double               g_halfChanPts = 0;          // полуширина кан�
 bool                 g_alertArmed    = true;
 bool                 g_alertWaiting  = false;
 int                  g_alertSide     = 0;
+bool                 g_signalArmed   = false;   // true - касание получено, ждём подтверждающую свечу
+int                  g_signalDir     = 0;       // направление ожидающего сигнала: +1 buy, -1 sell
+datetime             g_signalBarTime = 0;       // время бара M1, на котором получено касание
+datetime             g_waitStartTime = 0;       // время старта WAIT (для таймаута отката)
 
 //--- Для визуализации
 datetime             g_lastM1Bar = 0;
@@ -105,13 +135,46 @@ int OnInit()
    m_bbHandle  = iBands(m_symbol, InpMainTF, InpBBPeriod, 0, InpBBDev, InpBBApplied);
    m_atrHandle = iATR(m_symbol, InpMainTF, InpATRPeriod);
    m_atrH1Handle = iATR(m_symbol, PERIOD_H1, InpATRPeriod);
-   m_rsiHandle = (InpUseRSI ? iRSI(m_symbol, InpMainTF, InpRSIPeriod, PRICE_CLOSE) : INVALID_HANDLE);
-   m_adxHandle = (InpUseADX ? iADX(m_symbol, InpMainTF, InpADXPeriod) : INVALID_HANDLE);
+   m_rsiHandle = iRSI(m_symbol, InpMainTF, InpRSIPeriod, PRICE_CLOSE);
+   m_adxHandle = iADX(m_symbol, InpMainTF, InpADXPeriod);
+   m_maHandle  = iMA(m_symbol, InpMainTF, InpMATrendPeriod, 0, InpMAMethod, PRICE_CLOSE);
+
+   // Фильтр BB по RSI: всё создаётся ТОЛЬКО при включённом фильтре.
+   // При InpUseRSIBB=false советник работает как раньше - без лишних
+   // хэндлов, без iCustom и без добавления субокна SG_RSI_BB на график.
+   if(InpUseRSIBB)
+   {
+      // RSI на выбранном ТФ для фильтра BB по RSI (прямой расчёт, надёжно)
+      m_rsi2Handle = iRSI(m_symbol, InpRSIBB_RSITF, InpRSIBB_RSIPeriod, InpRSIBB_RsiApplied);
+      if(m_rsi2Handle == INVALID_HANDLE)
+      {
+         Print("Ошибка создания iRSI(", EnumToString(InpRSIBB_RSITF), ") - фильтр недоступен");
+         return INIT_FAILED;
+      }
+
+      // Индикатор SG_RSI_BB - только визуализация (не критично),
+      // iCustom БЕЗ параметров (передача параметров съезжает в этой сборке)
+      m_rsiBBHandle = iCustom(m_symbol, InpMainTF, "SG_RSI_BB");
+      if(m_rsiBBHandle != INVALID_HANDLE)
+      {
+         if(!ChartIndicatorAdd(0, 0, m_rsiBBHandle))
+            Print("Не удалось добавить SG_RSI_BB на график");
+      }
+      else
+         Print("Предупреждение: SG_RSI_BB не создан (график недоступен)");
+   }
+   else
+   {
+      m_rsiBBHandle = INVALID_HANDLE;
+      m_rsi2Handle  = INVALID_HANDLE;
+   }
 
    if(m_bbHandle == INVALID_HANDLE || m_atrHandle == INVALID_HANDLE ||
-      (InpUseRSI && m_rsiHandle == INVALID_HANDLE) ||
-      (InpUseADX && m_adxHandle == INVALID_HANDLE))
+      m_rsiHandle == INVALID_HANDLE || m_adxHandle == INVALID_HANDLE ||
+      m_maHandle == INVALID_HANDLE || m_atrH1Handle == INVALID_HANDLE)
       return INIT_FAILED;
+
+   // --- продолжение инициализации ---
 
    // Сброс состояний
    g_autoPosTicket = 0;
@@ -120,9 +183,14 @@ int OnInit()
    g_manualWait    = false;
    g_breakLevel    = 0.0;
    g_chanWidth     = 0.0;
+   g_reverseDone   = false;
    g_alertArmed    = true;
    g_alertWaiting  = false;
    g_alertSide     = 0;
+   g_signalArmed   = false;
+   g_signalDir     = 0;
+   g_signalBarTime = 0;
+   g_waitStartTime = 0;
 
    // Проверяем, есть ли уже открытая позиция с нашим магиком
    if(HasOpenPosition())
@@ -149,13 +217,15 @@ int OnInit()
    ObjectDelete(0, "SG_dist");
    ObjectDelete(0, "SG_dist_bg");
    ObjectDelete(0, "SG_rsi");
+   DeleteFilterPanelObjects();
 
    // Панель управления
    CreateButtons();
    UpdateButtons();
 
    Print("Советник инициализирован. Режим: ", (InpAutoMode ? "АВТО" : "МОНИТОР"),
-         ", Фильтры: RSI=", InpUseRSI, ", ADX=", InpUseADX, ", Trend=", InpUseTrendFilter);
+         ", Фильтры: RSI=", InpUseRSI, ", ADX=", InpUseADX, ", Trend=", InpUseTrendFilter,
+         ", RSI-BB=", InpUseRSIBB, " (TF=", EnumToString(InpRSIBB_RSITF), ")");
    return INIT_SUCCEEDED;
 }
 
@@ -168,7 +238,18 @@ void OnDeinit(const int reason)
    if(m_atrHandle != INVALID_HANDLE) IndicatorRelease(m_atrHandle);
    if(m_rsiHandle != INVALID_HANDLE) IndicatorRelease(m_rsiHandle);
    if(m_adxHandle != INVALID_HANDLE) IndicatorRelease(m_adxHandle);
+   if(m_maHandle != INVALID_HANDLE) IndicatorRelease(m_maHandle);
    if(m_atrH1Handle != INVALID_HANDLE) IndicatorRelease(m_atrH1Handle);
+   if(m_rsi2Handle != INVALID_HANDLE) IndicatorRelease(m_rsi2Handle);
+   if(m_rsiBBHandle != INVALID_HANDLE)
+   {
+      long chartId = ChartID();
+      int wins = (int)ChartGetInteger(0, CHART_WINDOWS_TOTAL);
+      for(int w = 0; w < wins; w++)
+         ChartIndicatorDelete(chartId, (int)w, "SG_RSI_BB");
+      IndicatorRelease(m_rsiBBHandle);
+      m_rsiBBHandle = INVALID_HANDLE;
+   }
    DeleteBandObjects();
    ObjectDelete(0, "SG_bid");
    ObjectDelete(0, "SG_dUp");
@@ -176,6 +257,7 @@ void OnDeinit(const int reason)
    ObjectDelete(0, "SG_dist");
    ObjectDelete(0, "SG_dist_bg");
    ObjectDelete(0, "SG_rsi");
+   DeleteFilterPanelObjects();
    DeleteButtons();
    Comment("");
 }
@@ -225,10 +307,17 @@ void UpdatePanel()
       DrawRSIValue(rsi);
    }
 
+   // Панель состояния фильтров (справа снизу)
+   DrawFilterPanel();
+
    // --- Вывод текстовой информации ---
    string status = g_waiting ? (g_manualWait ? "WAIT (ручная пауза)" : "WAIT (откат)") : "МОНИТОРИНГ";
-   string filters = StringFormat("RSI:%.1f ADX:%.1f", rsi, adx);
+   string filters = StringFormat("RSI:%.1f ADX:%.1f RSI-BB:%s", rsi, adx, (InpUseRSIBB ? "ВКЛ" : "ВЫКЛ"));
    string posInfo = (HasOpenPosition() ? StringFormat("ОТКРЫТА (dir=%d)", g_autoDir) : "НЕТ");
+   string sigInfo = "";
+   if(g_signalArmed && !HasOpenPosition())
+      sigInfo = (g_signalDir == 1 ? "ОЖИДАНИЕ BUY (первая бычья свеча M1)" :
+                                    "ОЖИДАНИЕ SELL (первая бычья свеча M1)");
 
    // Для отображения параметров WAIT (distLine теперь всегда положительный)
    double distLine = 0, waitLevel = 0, waitDistance = 0;
@@ -240,7 +329,7 @@ void UpdatePanel()
       double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
       double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
       distLine = MathAbs(bid - g_breakLevel) / point;   // всегда >= 0
-      
+
       waitLevel = (g_autoDir == 1) ? g_breakLevel + MathMin(InpWaitOffsetPts, (g_bbMid != 0 ? MathAbs(g_bbMid - g_breakLevel)/point : InpWaitOffsetPts)) * point : g_breakLevel - MathMin(InpWaitOffsetPts, (g_bbMid != 0 ? MathAbs(g_bbMid - g_breakLevel)/point : InpWaitOffsetPts)) * point;
       distMid = MathAbs(bid - mid) / point;
       waitDistance = MathAbs(bid - waitLevel) / point;   // расстояние до целевого уровня
@@ -251,6 +340,7 @@ void UpdatePanel()
                            "BB: %.2f / %.2f / %.2f\n"
                            "Расст. до верх.: %.0f пт, до ниж.: %.0f пт, до сред.: %.0f пт\n"
                            "Касание: %s\n"
+                           "Сигнал: %s\n"
                            "Состояние: %s\n"
                            "Фильтры: %s\n"
                            "ATR: %.2f, SL: %.1f пт, TP: %.1f пт\n"
@@ -261,6 +351,7 @@ void UpdatePanel()
                            up, mid, low,
                            distUp, distLow, distMid,
                            (touch==1?"НИЖНЯЯ":(touch==-1?"ВЕРХНЯЯ":"нет")),
+                           (sigInfo == "" ? "—" : sigInfo),
                            status,
                            filters,
                            atr, atr*InpATRSLMult/Point(), atr*InpATRSLMult*InpRR/Point(),
@@ -293,18 +384,13 @@ int ReadIndicators(double &up, double &mid, double &low, double &atr,
    ArraySetAsSeries(a, true);
    if(CopyBuffer(m_atrHandle, 0, 1, 1, a) == 1) atr = a[0]; else atr = 0;
 
-   if(InpUseRSI)
-   {
-      double r[];
-      ArraySetAsSeries(r, true);
-      if(CopyBuffer(m_rsiHandle, 0, 1, 1, r) == 1) rsi = r[0];
-   }
-   if(InpUseADX)
-   {
-      double b[];
-      ArraySetAsSeries(b, true);
-      if(CopyBuffer(m_adxHandle, 0, 1, 1, b) == 1) adx = b[0];
-   }
+   double r[];
+   ArraySetAsSeries(r, true);
+   if(CopyBuffer(m_rsiHandle, 0, 1, 1, r) == 1) rsi = r[0];
+
+   double b[];
+   ArraySetAsSeries(b, true);
+   if(CopyBuffer(m_adxHandle, 0, 1, 1, b) == 1) adx = b[0];
 
    // Касание на M1 (предпоследний закрытый бар)
    double m1Hi[], m1Lo[];
@@ -372,7 +458,7 @@ bool HasOpenPosition()
 //+------------------------------------------------------------------+
 //| Открытие сделки (только авто)                                   |
 //+------------------------------------------------------------------+
-bool OpenAutoTrade(const ENUM_ORDER_TYPE type)
+bool OpenAutoTrade(const ENUM_ORDER_TYPE type, const bool bypassFilters = false)
 {
    if(!InpAutoMode) return false;
    if(HasOpenPosition())
@@ -381,8 +467,8 @@ bool OpenAutoTrade(const ENUM_ORDER_TYPE type)
       return false;
    }
 
-   // Проверка фильтров
-   if(!PassFilters(type))
+   // Проверка фильтров (реверс после убытка их игнорирует)
+   if(!bypassFilters && (!PassFilters(type) || !PassRSIBBFilter(type)))
    {
       Print("Фильтры не пропускают сигнал ", EnumToString(type));
       return false;
@@ -487,14 +573,7 @@ bool PassFilters(const ENUM_ORDER_TYPE type)
    {
       double ma[];
       ArraySetAsSeries(ma, true);
-      int maHandle = iMA(m_symbol, InpMainTF, InpMATrendPeriod, 0, InpMAMethod, PRICE_CLOSE);
-      if(maHandle == INVALID_HANDLE) return false;
-      if(CopyBuffer(maHandle, 0, 1, 1, ma) != 1)
-      {
-         IndicatorRelease(maHandle);
-         return false;
-      }
-      IndicatorRelease(maHandle);
+      if(CopyBuffer(m_maHandle, 0, 1, 1, ma) != 1) return false;
       double price = (type == ORDER_TYPE_BUY ? SymbolInfoDouble(m_symbol, SYMBOL_ASK) :
                                                SymbolInfoDouble(m_symbol, SYMBOL_BID));
       if(price > ma[0] && type == ORDER_TYPE_SELL) return false;  // выше MA – не продаём
@@ -505,7 +584,7 @@ bool PassFilters(const ENUM_ORDER_TYPE type)
 }
 
 //+------------------------------------------------------------------+
-//| Авто-торговля: проверка касания и вход                          |
+//| Авто-торговля: касание BB = сигнал, вход после первой свечи      |
 //+------------------------------------------------------------------+
 void CheckAutoTrade()
 {
@@ -515,16 +594,70 @@ void CheckAutoTrade()
    if(ReadIndicators(up, mid, low, atr, rsi, adx, touch, distUp, distLow) != 0)
       return;
 
-   if(touch == 1 && InpAllowBuy)
+   // Последний закрытый бар M1 – свеча подтверждения
+   datetime t1 = iTime(m_symbol, PERIOD_M1, 1);
+   double o1[], c1[];
+   ArraySetAsSeries(o1, true);
+   ArraySetAsSeries(c1, true);
+   if(CopyOpen(m_symbol, PERIOD_M1, 1, 1, o1) != 1 ||
+      CopyClose(m_symbol, PERIOD_M1, 1, 1, c1) != 1)
+      return;
+   bool bullBar = (c1[0] > o1[0]);   // бычья свеча (close > open)
+   // Подтверждение в любом случае – ПЕРВАЯ БЫЧЬЯ свеча M1 (close > open)
+
+   // 1) Касание полосы BB – только фиксируем ожидающий сигнал
+   if(touch == 1 && InpAllowBuy && !g_signalArmed)
+   {
+      g_signalArmed   = true;
+      g_signalDir     = 1;
+      g_signalBarTime = t1;
+      Print("Сигнал BUY: касание нижней полосы, ждём первую бычью свечу M1");
+   }
+   else if(touch == -1 && InpAllowSell && !g_signalArmed)
+   {
+      g_signalArmed   = true;
+      g_signalDir     = -1;
+      g_signalBarTime = t1;
+      Print("Сигнал SELL: касание верхней полосы, ждём первую бычью свечу M1");
+   }
+
+   if(!g_signalArmed || g_signalDir == 0)
+      return;
+
+   // 2) Вход ПОСЛЕ первой подтверждающей свечи M1:
+   //    BUY  – касание нижней полосы
+   //    SELL – касание верхней полосы
+   if(g_signalDir == 1 && bullBar)
    {
       if(OpenAutoTrade(ORDER_TYPE_BUY))
-         Print("Авто-вход BUY по касанию нижней полосы");
+         Print("Авто-вход BUY после первой бычьей свечи M1");
+      ClearSignal();
    }
-   else if(touch == -1 && InpAllowSell)
+   else if(g_signalDir == -1 && bullBar)
    {
       if(OpenAutoTrade(ORDER_TYPE_SELL))
-         Print("Авто-вход SELL по касанию верхней полосы");
+         Print("Авто-вход SELL после первой бычьей свечи M1");
+      ClearSignal();
    }
+   // Подтверждения нет – проверяем окно ожидания
+   if(InpConfirmMaxBars > 0 && g_signalBarTime != 0 &&
+      t1 - g_signalBarTime >= InpConfirmMaxBars * 60)
+   {
+      Print("Сигнал отменён: подтверждающая свеча не появилась за ",
+            InpConfirmMaxBars, " бар(ов) M1");
+      ClearSignal();
+   }
+   // Окно не истекло – сигнал остаётся ждать следующую свечу
+}
+
+//+------------------------------------------------------------------+
+//| Сброс ожидающего сигнала входа                                   |
+//+------------------------------------------------------------------+
+void ClearSignal()
+{
+   g_signalArmed   = false;
+   g_signalDir     = 0;
+   g_signalBarTime = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -608,6 +741,7 @@ void CheckPositionClose()
    }
 
    g_autoPosTicket = 0; // сбрасываем тикет
+   ClearSignal();       // ожидающий сигнал входа сбрасываем
 
    if(!gotResult)
    {
@@ -615,6 +749,7 @@ void CheckPositionClose()
       g_autoDir = 0;
       g_waiting = false;
       g_breakLevel = 0;
+      g_waitStartTime = 0;
       return;
    }
 
@@ -623,14 +758,30 @@ void CheckPositionClose()
       Print("Авто-сделка закрыта с прибылью: ", DoubleToString(totalProfit, 2), ". Остаёмся в режиме MONITOR.");
       g_autoDir = 0;
       g_breakLevel = 0;
+      g_reverseDone = false;     // новая серия - реверс снова доступен
+      g_waitStartTime = 0;
       if(!g_manualWait)          // ручная пауза не сбрасывается автоматически
          g_waiting = false;
    }
    else
    {
-      Print("Авто-сделка закрыта с убытком: ", DoubleToString(totalProfit, 2),
-            ". Переходим в режим WAIT, ждём откат к средней.");
+      Print("Авто-сделка закрыта с убытком: ", DoubleToString(totalProfit, 2), ".");
+
+      if(InpReverseOnLoss && !g_reverseDone)
+      {
+         ENUM_ORDER_TYPE revType = (g_autoDir == 1 ? ORDER_TYPE_SELL : ORDER_TYPE_BUY);
+         g_reverseDone = true;   // реверс расходуется независимо от результата открытия
+         if(OpenAutoTrade(revType, true))
+         {
+            Print("Реверс: открыта встречная позиция ", EnumToString(revType));
+            return;
+         }
+         Print("Реверс не удался, переходим в WAIT");
+      }
+
+      Print("Переходим в режим WAIT, ждём откат к средней.");
       g_waiting = true;
+      g_waitStartTime = iTime(m_symbol, PERIOD_M1, 0);   // старт таймаута WAIT
       // g_breakLevel уже запомнен при открытии
    }
 }
@@ -647,6 +798,7 @@ void CheckWaitCondition()
       g_waiting = false;
       g_breakLevel = 0;
       g_autoDir = 0;
+      g_waitStartTime = 0;
       return;
    }
 
@@ -667,6 +819,27 @@ void CheckWaitCondition()
       g_waiting = false;
       g_breakLevel = 0;
       g_autoDir = 0;
+      g_reverseDone = false;   // новая серия ожидания сигналов - реверс снова доступен
+      g_waitStartTime = 0;
+      ClearSignal();           // сбрасываем ожидающий сигнал входа
+      return;
+   }
+
+   // Таймаут: откат не произошёл за N свечей M1 – сбрасываем WAIT в MONITOR
+   if(InpWaitMaxBars > 0 && g_waitStartTime != 0)
+   {
+      datetime waitBar = iTime(m_symbol, PERIOD_M1, 0);
+      if(waitBar - g_waitStartTime >= (datetime)InpWaitMaxBars * 60)
+      {
+         Print("WAIT сброшен: откат не произошёл за ", InpWaitMaxBars,
+               " свечей M1, возвращаемся в MONITOR.");
+         g_waiting = false;
+         g_breakLevel = 0;
+         g_autoDir = 0;
+         g_reverseDone = false;   // новая серия сигналов - реверс снова доступен
+         g_waitStartTime = 0;
+         ClearSignal();
+      }
    }
 }
 
@@ -864,6 +1037,153 @@ void DrawRSIValue(const double rsi)
 }
 
 //+------------------------------------------------------------------+
+//| Панель состояния фильтров (справа снизу, со смещением влево)    |
+//+------------------------------------------------------------------+
+// Смещение панели влево от правого края (% ширины графика)
+#define FLT_PANEL_XOFFSET_PERCENT 0.15
+
+int FilterPanelXOffset()
+{
+   return (int)(ChartGetInteger(0, CHART_WIDTH_IN_PIXELS) * FLT_PANEL_XOFFSET_PERCENT);
+}
+
+void SetFilterLabel(const string name, const int y, const string text,
+                    const color clr, const int fontSize = 10)
+{
+   const int corner = CORNER_RIGHT_LOWER;
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, corner);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
+      ObjectSetString(0, name, OBJPROP_FONT, "Arial");
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   }
+   // Обновляем позицию каждый раз (учитываем изменения ширины окна)
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, FilterPanelXOffset() + 12);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+}
+
+void DrawFilterPanel()
+{
+   const int corner = CORNER_RIGHT_LOWER;
+
+   // Фон панели
+   if(ObjectFind(0, "SG_flt_bg") < 0)
+   {
+      ObjectCreate(0, "SG_flt_bg", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, "SG_flt_bg", OBJPROP_CORNER, corner);
+      ObjectSetInteger(0, "SG_flt_bg", OBJPROP_YDISTANCE, 8);
+      ObjectSetInteger(0, "SG_flt_bg", OBJPROP_XSIZE, 270);
+      ObjectSetInteger(0, "SG_flt_bg", OBJPROP_YSIZE, 142);
+      ObjectSetInteger(0, "SG_flt_bg", OBJPROP_BGCOLOR, C'45,45,50');
+      ObjectSetInteger(0, "SG_flt_bg", OBJPROP_BORDER_COLOR, C'90,90,90');
+      ObjectSetInteger(0, "SG_flt_bg", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, "SG_flt_bg", OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, "SG_flt_bg", OBJPROP_HIDDEN, true);
+   }
+   // Обновляем позицию каждый раз (учитываем изменения ширины окна)
+   ObjectSetInteger(0, "SG_flt_bg", OBJPROP_XDISTANCE, FilterPanelXOffset() + 8);
+
+   // Текущие значения индикаторов
+   double rsi = 50, adx = 0, ma = 0;
+   double rArr[], aArr[], mArr[];
+   ArraySetAsSeries(rArr, true);
+   ArraySetAsSeries(aArr, true);
+   ArraySetAsSeries(mArr, true);
+   if(CopyBuffer(m_rsiHandle, 0, 1, 1, rArr) == 1) rsi = rArr[0];
+   if(CopyBuffer(m_adxHandle, 0, 1, 1, aArr) == 1) adx = aArr[0];
+   if(CopyBuffer(m_maHandle,  0, 1, 1, mArr) == 1) ma  = mArr[0];
+   double price = SymbolInfoDouble(m_symbol, SYMBOL_BID);
+   int digits = (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS);
+
+   // Заголовок
+   SetFilterLabel("SG_flt_hdr", 116, "=== ФИЛЬТРЫ ===", clrWhite, 10);
+
+   // --- RSI ---
+   string rsiTxt = StringFormat("RSI(%d) [%s]  %.1f  (OS %.0f / OB %.0f)",
+                                InpRSIPeriod, (InpUseRSI ? "ВКЛ" : "ВЫКЛ"), rsi,
+                                InpRSIOversold, InpRSIOverbought);
+   color rsiClr = clrGray;
+   if(InpUseRSI)
+      rsiClr = (rsi < InpRSIOversold || rsi > InpRSIOverbought) ? clrRed : clrLime;
+   SetFilterLabel("SG_flt_rsi", 70, rsiTxt, rsiClr);
+
+   // --- ADX ---
+   string adxTxt = StringFormat("ADX(%d) [%s]  %.1f  (>= %.0f)",
+                                InpADXPeriod, (InpUseADX ? "ВКЛ" : "ВЫКЛ"), adx, InpADXMin);
+   color adxClr = clrGray;
+   if(InpUseADX)
+      adxClr = (adx >= InpADXMin) ? clrLime : clrRed;
+   SetFilterLabel("SG_flt_adx", 46, adxTxt, adxClr);
+
+   // --- Трендовый фильтр (MA) ---
+   string maTxt = StringFormat("TREND(%d) [%s]  %s %s MA %s",
+                               InpMATrendPeriod, (InpUseTrendFilter ? "ВКЛ" : "ВЫКЛ"),
+                               DoubleToString(price, digits),
+                               (price > ma ? ">" : "<"),
+                               DoubleToString(ma, digits));
+   color maClr = clrGray;
+   if(InpUseTrendFilter)
+      maClr = (price > ma) ? clrLime : clrOrange;
+   SetFilterLabel("SG_flt_tr", 22, maTxt, maClr);
+
+   // --- Фильтр BB по RSI (прямой расчёт через свой RSI) ---
+   string rbbTxt = "RSI-BB: ВЫКЛ";
+   color rbbClr = clrGray;
+   if(InpUseRSIBB)
+   {
+      int    n2 = InpRSIBB_BBPeriod + 3;
+      double rb2[];
+      ArraySetAsSeries(rb2, true);
+      if(m_rsi2Handle != INVALID_HANDLE &&
+         CopyBuffer(m_rsi2Handle, 0, 1, n2, rb2) >= n2)
+      {
+         double s2 = 0;
+         for(int i = 0; i < InpRSIBB_BBPeriod; i++) s2 += rb2[i];
+         double ma2 = s2 / InpRSIBB_BBPeriod;
+         double v2 = 0;
+         for(int i = 0; i < InpRSIBB_BBPeriod; i++)
+         {
+            double d2 = rb2[i] - ma2;
+            v2 += d2 * d2;
+         }
+         double sd2 = MathSqrt(v2 / InpRSIBB_BBPeriod);
+         double lo2 = ma2 - InpRSIBB_BBDev * sd2;
+         double up2 = ma2 + InpRSIBB_BBDev * sd2;
+         bool okBuy  = (InpRSIBB_Mode == RSIBB_MODE_EXTREME) ?
+                       (rb2[0] < lo2 + InpRSIBB_Tolerance) :
+                       (rb2[0] < up2 - InpRSIBB_Tolerance);
+         bool okSell = (InpRSIBB_Mode == RSIBB_MODE_EXTREME) ?
+                       (rb2[0] > up2 - InpRSIBB_Tolerance) :
+                       (rb2[0] > lo2 + InpRSIBB_Tolerance);
+         rbbTxt = StringFormat("RSI-BB [%s] RSI %.1f | BB %.1f/%.1f",
+                               EnumToString(InpRSIBB_RSITF), rb2[0], lo2, up2);
+         rbbClr = (okBuy || okSell) ? clrLime : clrOrange;
+      }
+      else
+         rbbTxt = "RSI-BB: нет данных";
+   }
+   SetFilterLabel("SG_flt_rbb", 92, rbbTxt, rbbClr);
+}
+
+//+------------------------------------------------------------------+
+//| Удаление объектов панели фильтров                                |
+//+------------------------------------------------------------------+
+void DeleteFilterPanelObjects()
+{
+   ObjectDelete(0, "SG_flt_bg");
+   ObjectDelete(0, "SG_flt_hdr");
+   ObjectDelete(0, "SG_flt_rsi");
+   ObjectDelete(0, "SG_flt_adx");
+   ObjectDelete(0, "SG_flt_tr");
+   ObjectDelete(0, "SG_flt_rbb");
+}
+
+//+------------------------------------------------------------------+
 //| Удаление всех графических объектов                               |
 //+------------------------------------------------------------------+
 void DeleteBandObjects()
@@ -931,10 +1251,12 @@ void SetManualWait(const bool state)
 {
    g_manualWait = state;
    g_waiting    = state;
+   g_waitStartTime = 0;            // таймаут WAIT работает только для авто-режима
    if(!state)
    {
       g_breakLevel = 0;
       g_autoDir    = 0;
+      ClearSignal();
    }
    UpdateButtons();
    Print("Режим изменён вручную: ", (state ? "WAIT (пауза)" : "MONITORING"));
@@ -953,5 +1275,50 @@ void OnChartEvent(const int id,
       else if(sparam == "SG_btn_monitor")
          SetManualWait(false);
    }
+}
+
+
+//+------------------------------------------------------------------+
+//| Фильтр BB по RSI (динамические уровни)                           |
+//+------------------------------------------------------------------+
+bool PassRSIBBFilter(const ENUM_ORDER_TYPE type)
+{
+   if(!InpUseRSIBB) return true;
+   if(m_rsi2Handle == INVALID_HANDLE) return false;
+
+   // Читаем RSI со своего ТФ и считаем полосы BB по нему напрямую
+   int    n   = InpRSIBB_BBPeriod + 3;
+   double rr[];
+   ArraySetAsSeries(rr, true);
+   if(CopyBuffer(m_rsi2Handle, 0, 1, n, rr) < n) return false;
+
+   double sum = 0;
+   for(int i = 0; i < InpRSIBB_BBPeriod; i++) sum += rr[i];
+   double ma = sum / InpRSIBB_BBPeriod;
+   double var = 0;
+   for(int i = 0; i < InpRSIBB_BBPeriod; i++)
+   {
+      double d = rr[i] - ma;
+      var += d * d;
+   }
+   double sd = MathSqrt(var / InpRSIBB_BBPeriod);
+   double up = ma + InpRSIBB_BBDev * sd;
+   double lo = ma - InpRSIBB_BBDev * sd;
+   double r  = rr[0];
+   double tol = InpRSIBB_Tolerance;
+
+   if(type == ORDER_TYPE_BUY)
+   {
+      if(InpRSIBB_Mode == RSIBB_MODE_EXTREME)
+         return (r < lo + tol);   // покупка при перепроданности RSI
+      return (r < up - tol);      // запрет покупки при перекупленности RSI
+   }
+   else
+   {
+      if(InpRSIBB_Mode == RSIBB_MODE_EXTREME)
+         return (r > up - tol);   // продажа при перекупленности RSI
+      return (r > lo + tol);      // запрет продажи при перепроданности RSI
+   }
+
 }
 //+------------------------------------------------------------------+
