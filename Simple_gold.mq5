@@ -785,7 +785,9 @@ int GetCurrentSession()
       return 1;  // Вернуть любую активную сессию
 
    datetime now = TimeCurrent();
-   int hour = Hour(now);
+   MqlDateTime dt;
+   TimeToStruct(now, dt);
+   int hour = dt.hour;
 
    // OVERLAP: 13:00-16:00 (приоритет выше)
    if(InpEnableOVERLAP && hour >= 13 && hour < 16)
