@@ -1,12 +1,40 @@
 //+------------------------------------------------------------------+
 //|                                                  Simple_gold_v5.mq5 |
 //|                                      Copyright 2026, Bondarev A.   |
-//|  v5.09: вход после бычьей свечи M1 + таймаут WAIT по свечам       |
+//|  v5.10: WAIT валидация + pin-bar вход + динамический RR + фильтры   |
+//+------------------------------------------------------------------+
+//| ОСНОВНЫЕ УЛУЧШЕНИЯ v5.10:                                          |
+//|                                                                    |
+//|  1. ФИКСАЦИЯ WAIT ЦИКЛА:                                           |
+//|     - ValidateWaitState() проверяет консистентность каждый тик    |
+//|     - Разделение ручного (manual) и автоматического WAIT          |
+//|     - 24-часовой таймаут безопасности для выхода из зависания     |
+//|                                                                    |
+//|  2. УЛУЧШЕНИЕ ВХОДА (Entry Confirmation):                         |
+//|     - CheckPinBarConfirm() - детекция pin-bar вместо просто свечи  |
+//|       BUY: длинный нижний хвост + close>open                     |
+//|       SELL: длинный верхний хвост + close<open                   |
+//|     - CheckVolatilityFilter() - фильтр волатильности (ATR H1)      |
+//|       Принимает: 10-100 пункты                                    |
+//|       Отклоняет: <10 (слишком тихо) или >100 (хаос)               |
+//|                                                                    |
+//|  3. ДИНАМИЧЕСКИЙ RR:                                               |
+//|     - CalculateDynamicRR() адаптирует коэффициент к волатильности |
+//|     - Формула: RR = 2.0 + (ATR_H1 - 10) / 90 × 1.5                |
+//|     - Диапазон RR: 2.0 (низ) до 3.5 (высокая волатильность)       |
+//|     - MinRR=1.5 проверка отклоняет невыгодные входы              |
+//|                                                                    |
+//|  4. ВКЛЮЧЁННЫЕ ФИЛЬТРЫ (4 уровня защиты):                          |
+//|     - Уровень 1: RSI фильтр (BUY: RSI<40, SELL: RSI>60)           |
+//|     - Уровень 2: ADX (требует тренд ADX>20)                       |
+//|     - Уровень 3: MA(200) (BUY: выше MA, SELL: ниже MA)            |
+//|     - Уровень 4: Волатильность (10-100 пункты ATR H1)             |
+//|                                                                    |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Bondarev A."
 #property link      "https://www.mql5.com"
-#property version   "5.09"
-#property description "Торговля по BB: вход после первой бычьей свечи M1, таймаут WAIT, фильтры, логика WAIT."
+#property version   "5.10"
+#property description "XAUUSD M15 с BB, pin-bar входом, динамическим RR, WAIT валидацией и 4-мя фильтрами"
 
 #include <Trade\Trade.mqh>
 
@@ -28,45 +56,45 @@ input double            InpATRSLMult     = 1.0;           // SL = множите
 
 input group "=== Торговая логика ==="
 input bool              InpAutoMode      = true;          // true = авто, false – только мониторинг
-input double            InpBBOffsetPts   = 0.0;           // Смещение касания (пт)
-input bool              InpAllowBuy      = true;          // Разрешить покупки
-input bool              InpAllowSell     = true;          // Разрешить продажи
-input int               InpConfirmMaxBars = 10;           // Окно ожидания подтверждения: макс. свечей M1 (0 = без лимита)
+input double            InpBBOffsetPts   = 0.0;           // Смещение касания BB (пт)
+input bool              InpAllowBuy      = true;          // Разрешить BUY вход
+input bool              InpAllowSell     = true;          // Разрешить SELL вход
+input int               InpConfirmMaxBars = 10;           // Окно подтверждения pin-bar: макс. свечей M1 (0 = без лимита)
 
-input group "=== Логика отката (WAIT) ==="
-input double            InpWaitOffsetPts  = 50.0;         // Отход от линии (пт) для выхода из WAIT
-input int               InpWaitMaxBars    = 0;            // Сброс WAIT: нет отката за N свечей M1 (0 = без лимита)
+input group "=== Логика отката (WAIT) с валидацией ==="
+input double            InpWaitOffsetPts  = 50.0;         // Отход от g_breakLevel (пт) для выхода из WAIT
+input int               InpWaitMaxBars    = 0;            // Сброс WAIT: нет отката за N свечей M1 (0 = без лимита, есть 24ч таймаут)
 
 input group "=== Реверс после убытка ==="
-input bool              InpReverseOnLoss  = false;        // Один раз открыть встречную позицию после убытка
+input bool              InpReverseOnLoss  = false;        // Встречная позиция после убытка (обходит фильтры)
 
-input group "=== Трейлинг-стоп (фиксация прибыли) ==="
-input bool              InpTrailEnable     = true;         // Включить трейлинг-стоп
-input double            InpTrailActivateFrac = 0.5;       // Активация: прибыль = часть SL (0.5 = половина SL)
-input int               InpTrailOffsetPts  = 0;            // SL ставится на N пунктов от текущей цены (0 = безубыток)
+input group "=== Трейлинг-стоп (защита прибыли) ==="
+input bool              InpTrailEnable     = true;         // Включить трейлинг-стоп после достижения целевой прибыли
+input double            InpTrailActivateFrac = 0.5;       // Активация: прибыль > SL × этот коэффициент (0.5 = половина SL)
+input int               InpTrailOffsetPts  = 0;            // SL ставится на N пт от текущей цены (0 = безубыток)
 
-input group "=== Индикаторы ==="
-input int               InpATRPeriod     = 14;
-input int               InpBBPeriod      = 20;
-input double            InpBBDev         = 2.0;
-input ENUM_APPLIED_PRICE InpBBApplied    = PRICE_CLOSE;
+input group "=== Индикаторы основной ТФ ==="
+input int               InpATRPeriod     = 14;            // Период ATR (для расчёта SL/TP)
+input int               InpBBPeriod      = 20;            // Период Bollinger Bands
+input double            InpBBDev         = 2.0;           // Стандартные отклонения BB
+input ENUM_APPLIED_PRICE InpBBApplied    = PRICE_CLOSE;   // Применяемая цена для BB
 
-input group "=== Фильтры (по умолчанию ВЫКЛЮЧЕНЫ) ==="
-input bool              InpUseRSI        = false;
-input int               InpRSIPeriod     = 14;
-input double            InpRSIOversold   = 30.0;
-input double            InpRSIOverbought = 70.0;
+input group "=== Фильтры входа (ВКЛЮЧЕНЫ - 4 уровня защиты) ==="
+input bool              InpUseRSI        = true;          // Уровень 1: RSI - отклоняет перекупленность/перепроданность
+input int               InpRSIPeriod     = 14;            // Период RSI
+input double            InpRSIOversold   = 40.0;          // BUY: RSI < 40 (консервативные уровни для XAUUSD)
+input double            InpRSIOverbought = 60.0;          // SELL: RSI > 60
 
-input bool              InpUseADX        = false;
-input int               InpADXPeriod     = 14;
-input double            InpADXMin        = 20.0;
+input bool              InpUseADX        = true;          // Уровень 2: ADX - отклоняет боковое движение (требует тренда)
+input int               InpADXPeriod     = 14;            // Период ADX
+input double            InpADXMin        = 20.0;          // Минимум ADX для входа
 
-input bool              InpUseTrendFilter= false;
-input int               InpMATrendPeriod = 200;
-input ENUM_MA_METHOD    InpMAMethod      = MODE_SMA;
+input bool              InpUseTrendFilter= true;          // Уровень 3: MA(200) - фильтр направления (BUY выше, SELL ниже)
+input int               InpMATrendPeriod = 200;           // Период MA для фильтра тренда
+input ENUM_MA_METHOD    InpMAMethod      = MODE_SMA;      // Метод MA
 
 input group "=== Фильтр BB по RSI (динамические уровни) ==="
-input bool               InpUseRSIBB          = false;        // Включить фильтр BB по RSI
+input bool               InpUseRSIBB          = false;        // Дополнительный фильтр: BB по RSI вместо цены
 input ENUM_TIMEFRAMES    InpRSIBB_RSITF       = PERIOD_H1;    // Таймфрейм для расчёта RSI
 input int                InpRSIBB_RSIPeriod   = 14;           // Период RSI
 input ENUM_APPLIED_PRICE InpRSIBB_RsiApplied  = PRICE_CLOSE;  // Применяемая цена для RSI
@@ -75,14 +103,16 @@ input double             InpRSIBB_BBDev       = 2.0;          // Отклоне�
 input ENUM_RSIBB_MODE    InpRSIBB_Mode        = RSIBB_MODE_EXTREME; // Режим фильтра
 input double             InpRSIBB_Tolerance   = 0.0;          // Допуск от полосы (ед. RSI)
 
-input group "=== Алерты ==="
-input bool              InpAlertEnable   = true;
-input double            InpAlertTriggerPts = 50.0;
-input bool              InpAlertLocal    = true;
-input bool              InpAlertPush     = true;
+input group "=== Нотификации ==="
+input bool              InpAlertEnable   = true;          // Показывать нотификации при касании полос
 
-input group "=== Отображение ==="
-input bool              InpShowIndicators = true;   // Показывать BB на графике
+input double            InpAlertTriggerPts = 50.0;         // Расстояние до алерта (пт) - воспминание
+
+input bool              InpAlertLocal    = true;          // Локальные алерты
+input bool              InpAlertPush     = true;          // Push-нотификации
+
+input group "=== Визуализация и дебуг ==="
+input bool              InpShowIndicators = true;         // Показывать BB, ATR и другие индикаторы на графике
 
 //+------------------------------------------------------------------+
 //| Глобальные переменные                                            |
@@ -223,9 +253,17 @@ int OnInit()
    CreateButtons();
    UpdateButtons();
 
-   Print("Советник инициализирован. Режим: ", (InpAutoMode ? "АВТО" : "МОНИТОР"),
-         ", Фильтры: RSI=", InpUseRSI, ", ADX=", InpUseADX, ", Trend=", InpUseTrendFilter,
-         ", RSI-BB=", InpUseRSIBB, " (TF=", EnumToString(InpRSIBB_RSITF), ")");
+   Print("\n========== ПРОСТОЙ ЗОЛОТО v5.10 ==========");
+   Print("Режим: ", (InpAutoMode ? "АВТО" : "МОНИТОР"));
+   Print("Версия: 5.10 - WAIT валидация + pin-bar вход + динамический RR + 4 фильтра");
+   Print("Фильтры входа:");
+   Print("  1. RSI: ", (InpUseRSI ? "ВКЛ (BUY<40, SELL>60)" : "ВЫКЛ"));
+   Print("  2. ADX: ", (InpUseADX ? "ВКЛ (>20)" : "ВЫКЛ"));
+   Print("  3. MA200: ", (InpUseTrendFilter ? "ВКЛ (фильтр тренда)" : "ВЫКЛ"));
+   Print("  4. Волатильность: ВКЛ (10-100 пт ATR H1)");
+   Print("Дополнительно: RSI-BB=", (InpUseRSIBB ? "ВКЛ" : "ВЫКЛ"), " (TF=", EnumToString(InpRSIBB_RSITF), ")");
+   Print("Вход: pin-bar подтверждение + динамический RR (2.0-3.5)");
+   Print("========================================\n");
    return INIT_SUCCEEDED;
 }
 
@@ -265,22 +303,30 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 //| OnTick                                                           |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Основной цикл советника - логика обработки каждого тика           |
+//| Порядок: 1. Валидация WAIT  2. Трейлинг-стоп  3. Закрытие позиции |
+//|          4. Проверка отката (если в WAIT)  5. Новые входы        |
+//+------------------------------------------------------------------+
 void OnTick()
 {
    // Обновление данных и визуализации
    UpdatePanel();
 
-   // Трейлинг-стоп (фиксация прибыли)
+   // [TRAILING_STOP] Трейлинг-стоп (фиксация прибыли)
    CheckTrailingStop();
 
-   // Обработка закрытия позиции (переход в WAIT при убытке)
+   // [POSITION_CLOSE] Обработка закрытия позиции (переход в WAIT при убытке)
    CheckPositionClose();
 
-   // Если в WAIT – проверяем откат
+   // [WAIT_VALIDATION] Валидация состояния WAIT (проверка консистентности каждый тик)
+   ValidateWaitState();
+
+   // [WAIT_CHECK] Если в WAIT – проверяем откат к средней для выхода
    if(g_waiting)
       CheckWaitCondition();
 
-   // Авто-торговля (если разрешена и нет WAIT)
+   // [NEW_ENTRY] Авто-торговля (если разрешена и нет WAIT и нет открытой позиции)
    if(InpAutoMode && !g_waiting && !HasOpenPosition())
       CheckAutoTrade();
 }
@@ -456,7 +502,47 @@ bool HasOpenPosition()
 }
 
 //+------------------------------------------------------------------+
-//| Открытие сделки (только авто)                                   |
+//| Расчет динамического RR адаптивно к волатильности (ATR H1)       |
+//| Формула: RR = 2.0 + (ATR_H1 - 10) / (100 - 10) × 1.5              |
+//| Результат: RR от 2.0 (низкая волатильность) до 3.5 (высокая)     |
+//| MinRR=1.5: если RR<1.5 - вход отклоняется как невыгодный        |
+//+------------------------------------------------------------------+
+double CalculateDynamicRR()
+{
+   double atrH1[];
+   ArraySetAsSeries(atrH1, true);
+   if(CopyBuffer(m_atrH1Handle, 0, 1, 1, atrH1) != 1)
+      return InpRR;  // Если ошибка, используем фиксированный RR
+
+   double atr = atrH1[0];
+   double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+   double atrPts = atr / point;
+
+   // Диапазон волатильности (в пунктах)
+   const double MIN_VOLATILITY_PTS = 10.0;
+   const double MAX_VOLATILITY_PTS = 100.0;
+
+   // Динамический RR: базовый 2.0 + волатильность фактор (от 0 до 1.5)
+   // Когда ATR низкий: RR = 2.0
+   // Когда ATR высокий: RR = 3.5
+   double volFactor = 0.0;
+   if(atrPts >= MAX_VOLATILITY_PTS)
+      volFactor = 1.5;  // Максимум
+   else if(atrPts <= MIN_VOLATILITY_PTS)
+      volFactor = 0.0;  // Минимум
+   else
+      volFactor = (atrPts - MIN_VOLATILITY_PTS) / (MAX_VOLATILITY_PTS - MIN_VOLATILITY_PTS) * 1.5;
+
+   double dynamicRR = 2.0 + volFactor;  // RR от 2.0 до 3.5
+
+   Print("[DYNAMIC_RR] ATR H1=", atrPts, " пт, RR=", DoubleToString(dynamicRR, 2));
+   return dynamicRR;
+}
+
+//+------------------------------------------------------------------+
+//| Открытие сделки (только авто) с динамическим RR                   |
+//| SL = ATR × InpATRSLMult                                           |
+//| TP = SL × CalculateDynamicRR() (адаптивно к волатильности)           |
 //+------------------------------------------------------------------+
 bool OpenAutoTrade(const ENUM_ORDER_TYPE type, const bool bypassFilters = false)
 {
@@ -489,7 +575,18 @@ bool OpenAutoTrade(const ENUM_ORDER_TYPE type, const bool bypassFilters = false)
    if(atrVal <= 0) return false;
 
    double slDist = atrVal * InpATRSLMult;
-   double tpDist = slDist * InpRR;
+   // Используем динамический RR вместо фиксированного InpRR
+   double dynamicRR = CalculateDynamicRR();
+   double tpDist = slDist * dynamicRR;
+   
+   // Проверка MinRR = 1.5 (минимальное соотношение профита к убытку)
+   const double MIN_RR = 1.5;
+   if(dynamicRR < MIN_RR)
+   {
+      Print("[ENTRY_REJECT] RR =", DoubleToString(dynamicRR, 2), " < MinRR=", DoubleToString(MIN_RR, 2), ". Входит невыгоден.");
+      return false;
+   }
+   
    double sl, tp;
    if(type == ORDER_TYPE_BUY)
    {
@@ -542,7 +639,9 @@ bool OpenAutoTrade(const ENUM_ORDER_TYPE type, const bool bypassFilters = false)
 }
 
 //+------------------------------------------------------------------+
-//| Проверка фильтров                                                |
+//| Проверка фильтров входа (УРОВНИ 2-3): RSI, ADX, MA(200)           |
+//| BUY: RSI<40, ADX>20, цена выше MA200                             |
+//| SELL: RSI>60, ADX>20, цена ниже MA200                            |
 //+------------------------------------------------------------------+
 bool PassFilters(const ENUM_ORDER_TYPE type)
 {
@@ -584,7 +683,103 @@ bool PassFilters(const ENUM_ORDER_TYPE type)
 }
 
 //+------------------------------------------------------------------+
-//| Авто-торговля: касание BB = сигнал, вход после первой свечи      |
+//| Проверка пин-бара для подтверждения (на M1)                     |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Детекция pin-bar (хвост > 2x тела) для подтверждения входа        |
+//| BUY: длинный нижний хвост (ниже open) + close>open (быч. свеча)   |
+//| SELL: длинный верхний хвост (выше open) + close<open (медв. свеча)|
+//+------------------------------------------------------------------+
+bool CheckPinBarConfirm(const int direction)  // direction: +1 = BUY, -1 = SELL
+{
+   // Получаем последнюю свечу M1 (закрытую)
+   double o[], c[], h[], l[];
+   ArraySetAsSeries(o, true);
+   ArraySetAsSeries(c, true);
+   ArraySetAsSeries(h, true);
+   ArraySetAsSeries(l, true);
+
+   if(CopyOpen(m_symbol, PERIOD_M1, 1, 1, o) != 1 ||
+      CopyClose(m_symbol, PERIOD_M1, 1, 1, c) != 1 ||
+      CopyHigh(m_symbol, PERIOD_M1, 1, 1, h) != 1 ||
+      CopyLow(m_symbol, PERIOD_M1, 1, 1, l) != 1)
+      return false;
+
+   // Чтобы был пин-бар (пустотель) и правильное направление закрытия:
+   bool pinBarBody = false;
+   bool correctClose = false;
+
+   if(direction == 1)  // BUY: Нижняя тень длинная, Close > Open
+   {
+      double bodySize = MathAbs(c[0] - o[0]);
+      double tailSize = MathAbs(o[0] - l[0]);
+      double topSize  = MathAbs(h[0] - c[0]);
+
+      // Нижняя тень > 2 * тела (пин-бар)
+      pinBarBody = (tailSize > bodySize * 2.0);
+      // Close > Open (верное направление)
+      correctClose = (c[0] > o[0]);
+   }
+   else if(direction == -1)  // SELL: Верхняя тень длинная, Close < Open
+   {
+      double bodySize = MathAbs(c[0] - o[0]);
+      double tailSize = MathAbs(h[0] - o[0]);
+      double botSize  = MathAbs(c[0] - l[0]);
+
+      // Верхняя тень > 2 * тела (пин-бар)
+      pinBarBody = (tailSize > bodySize * 2.0);
+      // Close < Open (верное направление)
+      correctClose = (c[0] < o[0]);
+   }
+
+   return (pinBarBody && correctClose);
+}
+
+//+------------------------------------------------------------------+
+//| Фильтр волатильности (колебание ATR H1)                  |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Фильтр волатильности: отклоняет входы при слишком тихом или       |
+//| слишком хаотичном рынке (проверяет ATR на H1)                     |
+//| Диапазон: 10-100 пункты. <10 = мало движения, >100 = хаос/слипы   |
+//+------------------------------------------------------------------+
+bool CheckVolatilityFilter()
+{
+   double atrH1[];
+   ArraySetAsSeries(atrH1, true);
+   if(CopyBuffer(m_atrH1Handle, 0, 1, 1, atrH1) != 1)
+      return false;  // Нет данных, разрешаем вход
+
+   double atr = atrH1[0];
+   double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+   double atrPts = atr / point;
+
+   // Волатильность средняя: ATR в диапазоне 10-100 пт (оптимально для торговли)
+   const double MIN_VOLATILITY_PTS = 10.0;
+   const double MAX_VOLATILITY_PTS = 100.0;
+
+   if(atrPts < MIN_VOLATILITY_PTS)
+   {
+      Print("[VOLATILITY] Слишком низкая волатильность (ATR H1 = ", atrPts, " пт < ", MIN_VOLATILITY_PTS, "). Пропускаем.");
+      return false;
+   }
+   if(atrPts > MAX_VOLATILITY_PTS)
+   {
+      Print("[VOLATILITY] Слишком высокая волатильность (ATR H1 = ", atrPts, " пт > ", MAX_VOLATILITY_PTS, "). Пропускаем.");
+      return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Авто-торговля: касание BB = сигнал, вход афтер пин-бар      |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Автоматическая проверка на вход с pin-bar подтверждением         |
+//| Логика: 1) Касание BB -> вооружение сигнала                        |
+//|         2) Проверка фильтров (RSI, ADX, MA200, волатильность)      |
+//|         3) Ожидание pin-bar подтверждения на M1                    |
+//|         4) Открытие с динамическим RR (2.0-3.5)                   |
 //+------------------------------------------------------------------+
 void CheckAutoTrade()
 {
@@ -594,7 +789,11 @@ void CheckAutoTrade()
    if(ReadIndicators(up, mid, low, atr, rsi, adx, touch, distUp, distLow) != 0)
       return;
 
-   // Последний закрытый бар M1 – свеча подтверждения
+   // [ENTRY_FILTER_1] Проверяем фильтр волатильности (ATR H1: 10-100 пт)
+   if(!CheckVolatilityFilter())
+      return;
+
+   // Получаем последнюю свечу M1 (закрытую)
    datetime t1 = iTime(m_symbol, PERIOD_M1, 1);
    double o1[], c1[];
    ArraySetAsSeries(o1, true);
@@ -602,8 +801,6 @@ void CheckAutoTrade()
    if(CopyOpen(m_symbol, PERIOD_M1, 1, 1, o1) != 1 ||
       CopyClose(m_symbol, PERIOD_M1, 1, 1, c1) != 1)
       return;
-   bool bullBar = (c1[0] > o1[0]);   // бычья свеча (close > open)
-   // Подтверждение в любом случае – ПЕРВАЯ БЫЧЬЯ свеча M1 (close > open)
 
    // 1) Касание полосы BB – только фиксируем ожидающий сигнал
    if(touch == 1 && InpAllowBuy && !g_signalArmed)
@@ -611,43 +808,40 @@ void CheckAutoTrade()
       g_signalArmed   = true;
       g_signalDir     = 1;
       g_signalBarTime = t1;
-      Print("Сигнал BUY: касание нижней полосы, ждём первую бычью свечу M1");
+      Print("[SIGNAL] BUY: касание нижней полосы BB, ждём пин-бар на M1");
    }
    else if(touch == -1 && InpAllowSell && !g_signalArmed)
    {
       g_signalArmed   = true;
       g_signalDir     = -1;
       g_signalBarTime = t1;
-      Print("Сигнал SELL: касание верхней полосы, ждём первую бычью свечу M1");
+      Print("[SIGNAL] SELL: касание верхней полосы BB, ждём пин-бар на M1");
    }
 
    if(!g_signalArmed || g_signalDir == 0)
       return;
 
-   // 2) Вход ПОСЛЕ первой подтверждающей свечи M1:
-   //    BUY  – касание нижней полосы
-   //    SELL – касание верхней полосы
-   if(g_signalDir == 1 && bullBar)
+   // 2) Выздывать до пин-бара на M1:
+   if(g_signalDir == 1 && CheckPinBarConfirm(1))  // BUY и пин-бар сформировался
    {
       if(OpenAutoTrade(ORDER_TYPE_BUY))
-         Print("Авто-вход BUY после первой бычьей свечи M1");
+         Print("[ENTRY] Авто-вход BUY афтер пин-бар M1");
       ClearSignal();
    }
-   else if(g_signalDir == -1 && bullBar)
+   else if(g_signalDir == -1 && CheckPinBarConfirm(-1))  // SELL и пин-бар сформировался
    {
       if(OpenAutoTrade(ORDER_TYPE_SELL))
-         Print("Авто-вход SELL после первой бычьей свечи M1");
+         Print("[ENTRY] Авто-вход SELL афтер пин-бар M1");
       ClearSignal();
    }
-   // Подтверждения нет – проверяем окно ожидания
+
+   // Проверяем окно ожидания
    if(InpConfirmMaxBars > 0 && g_signalBarTime != 0 &&
       t1 - g_signalBarTime >= InpConfirmMaxBars * 60)
    {
-      Print("Сигнал отменён: подтверждающая свеча не появилась за ",
-            InpConfirmMaxBars, " бар(ов) M1");
+      Print("[SIGNAL] Отмена: пин-бар не появился за ", InpConfirmMaxBars, " бар(ов) M1");
       ClearSignal();
    }
-   // Окно не истекло – сигнал остаётся ждать следующую свечу
 }
 
 //+------------------------------------------------------------------+
@@ -787,35 +981,120 @@ void CheckPositionClose()
 }
 
 //+------------------------------------------------------------------+
-//| Проверка условия отката (distLine теперь всегда положительный)   |
+//| Валидация состояния WAIT - проверка консистентности каждый тик    |
+//+------------------------------------------------------------------+
+void ValidateWaitState()
+{
+   // Если нет открытой позиции и WAIT активен, это ошибка
+   if(g_waiting && HasOpenPosition())
+   {
+      // Позиция открыта но мы в WAIT - это ошибка, выходим
+      Print("[WARN] Позиция открыта но g_waiting=true. Сбрасываем WAIT.");
+      g_waiting = false;
+      g_waitStartTime = 0;
+      return;
+   }
+
+   // Если в авто-WAIT проверяем, не развалилось ли состояние
+   if(g_waiting && !g_manualWait)
+   {
+      // Если g_autoDir невалиден, выходим из WAIT
+      if(g_autoDir != 1 && g_autoDir != -1)
+      {
+         Print("[WARN] g_autoDir невалиден (", g_autoDir, "). Сбрасываем WAIT.");
+         g_waiting = false;
+         g_breakLevel = 0;
+         g_waitStartTime = 0;
+         ClearSignal();
+         return;
+      }
+
+      // Если g_breakLevel == 0, выходим из WAIT
+      if(g_breakLevel == 0)
+      {
+         Print("[WARN] g_breakLevel == 0 в авто-WAIT. Сбрасываем WAIT.");
+         g_waiting = false;
+         g_autoDir = 0;
+         g_waitStartTime = 0;
+         ClearSignal();
+         return;
+      }
+
+      // Если WAIT продолжается более 24 часов без движения - принудительный выход
+      if(g_waitStartTime != 0)
+      {
+         datetime nowBar = iTime(m_symbol, PERIOD_M1, 0);
+         if(nowBar - g_waitStartTime >= 86400)  // 24 часа = 86400 секунд
+         {
+            Print("[WARN] WAIT длится > 24 часов. Принудительный выход в MONITOR.");
+            g_waiting = false;
+            g_breakLevel = 0;
+            g_autoDir = 0;
+            g_reverseDone = false;
+            g_waitStartTime = 0;
+            ClearSignal();
+            return;
+         }
+      }
+   }
+
+   // Если в ручном режиме но открыта позиция - выходим из ручного WAIT
+   if(g_waiting && g_manualWait && HasOpenPosition())
+   {
+      Print("[WARN] В ручном WAIT открыта позиция. Сбрасываем режим паузы.");
+      g_manualWait = false;
+      g_waiting = false;
+      ClearSignal();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Проверка условия отката (откат к средней полосе BB)              |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Проверка условия отката WAIT: откат от g_breakLevel на offset    |
+//| Ручной WAIT: игнорирует условия, только выход по кнопке         |
+//| Автоматический WAIT: требует откат + таймаут (24ч или N свечей)  |
 //+------------------------------------------------------------------+
 void CheckWaitCondition()
 {
    if(!g_waiting) return;
-   if(g_manualWait) return;   // ручная пауза – ждём нажатия кнопки MONITORING
+
+   // Если ручной WAIT - просто ждём нажатия кнопки, без проверки условий
+   if(g_manualWait)
+      return;
+
+   // Авто-WAIT: проверяем откат и таймаут
    if(g_breakLevel == 0 || (g_autoDir != 1 && g_autoDir != -1))
    {
+      Print("[DEBUG] Exit WAIT: invalid state (breakLevel=" , g_breakLevel, ", autoDir=", g_autoDir, ")");
       g_waiting = false;
       g_breakLevel = 0;
       g_autoDir = 0;
+      g_reverseDone = false;
       g_waitStartTime = 0;
+      ClearSignal();
       return;
    }
 
    double bid   = SymbolInfoDouble(m_symbol, SYMBOL_BID);
    double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+
    // Отход от линии пробоя, ограниченный средней полосой BB (в пунктах)
    double offsetPts = MathMin(InpWaitOffsetPts,
                               (g_bbMid != 0 ? MathAbs(g_bbMid - g_breakLevel) / point : InpWaitOffsetPts));
    double waitLevel = (g_autoDir == 1) ? g_breakLevel + offsetPts * point
                                        : g_breakLevel - offsetPts * point;
+
+   // Проверка условия отката: цена вернулась на уровень?
    // BUY: цена поднялась до уровня / SELL: цена опустилась до уровня
    bool waitComplete = (g_autoDir == 1) ? (bid >= waitLevel) : (bid <= waitLevel);
-   if(waitComplete)   // откат достиг уровня (bid >= waitLevel для BUY / bid <= waitLevel для SELL)
+
+   if(waitComplete)
    {
-      Print("Откат достигнут: bid=", DoubleToString(bid, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS)),
-            ", уровень=", DoubleToString(waitLevel, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS)),
-            "). Выходим из WAIT в MONITOR.");
+      Print("[INFO] Откат достигнут: bid=", DoubleToString(bid, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS)),
+            ", waitLevel=", DoubleToString(waitLevel, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS)),
+            ". Выходим из WAIT в MONITOR.");
       g_waiting = false;
       g_breakLevel = 0;
       g_autoDir = 0;
@@ -828,17 +1107,19 @@ void CheckWaitCondition()
    // Таймаут: откат не произошёл за N свечей M1 – сбрасываем WAIT в MONITOR
    if(InpWaitMaxBars > 0 && g_waitStartTime != 0)
    {
-      datetime waitBar = iTime(m_symbol, PERIOD_M1, 0);
-      if(waitBar - g_waitStartTime >= (datetime)InpWaitMaxBars * 60)
+      datetime nowBar = iTime(m_symbol, PERIOD_M1, 0);
+      // Проверяем в секундах (не bar-bar)
+      if(nowBar - g_waitStartTime >= (datetime)InpWaitMaxBars * 60)
       {
-         Print("WAIT сброшен: откат не произошёл за ", InpWaitMaxBars,
-               " свечей M1, возвращаемся в MONITOR.");
+         Print("[INFO] WAIT сброшен по таймауту: откат не произошёл за ", InpWaitMaxBars,
+               " свечей M1. Возвращаемся в MONITOR.");
          g_waiting = false;
          g_breakLevel = 0;
          g_autoDir = 0;
          g_reverseDone = false;   // новая серия сигналов - реверс снова доступен
          g_waitStartTime = 0;
          ClearSignal();
+         return;
       }
    }
 }
@@ -1247,19 +1528,35 @@ void DeleteButtons()
 //+------------------------------------------------------------------+
 //| Ручное переключение режима (кнопки)                              |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Управление WAIT состоянием: вход/выход с явным сбросом переменных |
+//| true = вход в WAIT, false = выход из WAIT с полной очисткой       |
+//+------------------------------------------------------------------+
 void SetManualWait(const bool state)
 {
-   g_manualWait = state;
-   g_waiting    = state;
-   g_waitStartTime = 0;            // таймаут WAIT работает только для авто-режима
-   if(!state)
+   if(state)
    {
+      // Вход в ручной WAIT
+      g_manualWait = true;
+      g_waiting = true;
+      g_waitStartTime = 0;   // ручной режим не использует таймаут
+      Print("[INFO] Ручной WAIT: режим паузы активирован. Нажмите MONITORING для выхода.");
+   }
+   else
+   {
+      // Выход из ручного WAIT в режим MONITORING
+      if(g_manualWait)
+      {
+         Print("[INFO] Выход из ручного WAIT в режим MONITORING.");
+      }
+      g_manualWait = false;
+      g_waiting = false;
       g_breakLevel = 0;
-      g_autoDir    = 0;
+      g_autoDir = 0;
+      g_waitStartTime = 0;
       ClearSignal();
    }
    UpdateButtons();
-   Print("Режим изменён вручную: ", (state ? "WAIT (пауза)" : "MONITORING"));
 }
 
 //+------------------------------------------------------------------+
