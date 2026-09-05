@@ -785,7 +785,7 @@ int GetCurrentSession()
       return 1;  // Вернуть любую активную сессию
 
    datetime now = TimeCurrent();
-   int hour = TimeHour(now);
+   int hour = Hour(now);
 
    // OVERLAP: 13:00-16:00 (приоритет выше)
    if(InpEnableOVERLAP && hour >= 13 && hour < 16)
