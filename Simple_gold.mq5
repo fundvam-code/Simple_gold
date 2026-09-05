@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
 //|                                                  Simple_gold_v5.mq5 |
 //|                                      Copyright 2026, Bondarev A.   |
-//|  v5.13: WAIT + pin-bar + RR + сессии GMT (ASIA/LONDON/NY/OVERLAP)    |
+//|  v5.14: ОПТИМИЗИРОВАННАЯ (МАКСИМУМ ВХОДОВ) - база для оптимизации|
 //+------------------------------------------------------------------+
-//| ОСНОВНЫЕ УЛУЧШЕНИЯ v5.13 (временные сессии GMT):                                          |
+//| ОСНОВНЫЕ УЛУЧШЕНИЯ v5.14 (КОНФИГ для МАКСИМУМА ВХОДОВ - база оптимизации):                                          |
 //|                                                                    |
 //|  1. ФИКСАЦИЯ WAIT ЦИКЛА:                                           |
 //|     - ValidateWaitState() проверяет консистентность каждый тик    |
@@ -48,11 +48,21 @@
 //|     - Вне сессии: блокируются новые входы, WAIT отменяется (опц.) |
 //|     - Главный выключатель: InpUseSessionFilter (вкл/выкл все)      |
 //|                                                                    |
+//|  7. КОНФИГУРАЦИЯ v5.14 - МАКСИМУМ ВХОДОВ для оптимизации:         |
+//|     - InpPinBarTailRatio: 1.5 (мягче критерий)                    |
+//|     - InpConfirmMaxBars: 0 (без лимита на ожидание)               |
+//|     - RSI диапазон: 50/50 (расширен с 40/60)                      |
+//|     - ADX min: 10 (ослаблено с 20)                                |
+//|     - MA200 фильтр: ОТКЛЮЧЕН (было включено)                       |
+//|     - Сессии GMT: ОТКЛЮЧЕНЫ (торговля 24/7)                        |
+//|     - Волатильность: 5-150 пт (расширено с 10-100)                |
+//|     -> БАЗОВАЯ ТОЧКА для оптимизации: большое кол-во входов       |
+//|                                                                    |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Bondarev A."
 #property link      "https://www.mql5.com"
-#property version   "5.13"
-#property description "XAUUSD: WAIT валидация + pin-bar (M1) + динамический RR + 4 фильтра + временные сессии GMT (ASIA/LONDON/NEWYORK/OVERLAP)"
+#property version   "5.14"
+#property description "XAUUSD: WAIT + pin-bar + RR + фильтры + сессии GMT (конфиг 5.14: максимум входов для оптимизации)"
 
 #include <Trade\Trade.mqh>
 
@@ -79,8 +89,8 @@ input bool              InpAllowBuy      = true;          // Разрешить 
 input bool              InpAllowSell     = true;          // Разрешить SELL вход
 
 input group "=== Определение Pin-Bar (подтверждение входа) ==="
-input double            InpPinBarTailRatio = 2.0;         // Коэффициент хвоста: хвост > тело × этот коэф. (2.0 = хвост в 2 раза больше тела)
-input int               InpConfirmMaxBars = 10;           // Окно подтверждения pin-bar: макс. свечей M1 (0 = без лимита)
+input double            InpPinBarTailRatio = 1.5;         // Коэффициент хвоста: хвост > тело × этот коэф. (1.5 = более мягкий критерий для входов)
+input int               InpConfirmMaxBars = 0;            // Окно подтверждения pin-bar: макс. свечей M1 (0 = без лимита)
 
 input group "=== Логика отката (WAIT) с валидацией ==="
 input double            InpWaitOffsetPts  = 50.0;         // Отход от g_breakLevel (пт) для выхода из WAIT
@@ -103,14 +113,14 @@ input ENUM_APPLIED_PRICE InpBBApplied    = PRICE_CLOSE;   // Применяем�
 input group "=== Фильтры входа (ВКЛЮЧЕНЫ - 4 уровня защиты) ==="
 input bool              InpUseRSI        = true;          // Уровень 1: RSI - отклоняет перекупленность/перепроданность
 input int               InpRSIPeriod     = 14;            // Период RSI
-input double            InpRSIOversold   = 40.0;          // BUY: RSI < 40 (консервативные уровни для XAUUSD)
-input double            InpRSIOverbought = 60.0;          // SELL: RSI > 60
+input double            InpRSIOversold   = 50.0;          // BUY: RSI < 50 (расширенный диапазон для максимума входов)
+input double            InpRSIOverbought = 50.0;          // SELL: RSI > 50 (расширенный диапазон)
 
 input bool              InpUseADX        = true;          // Уровень 2: ADX - отклоняет боковое движение (требует тренда)
 input int               InpADXPeriod     = 14;            // Период ADX
-input double            InpADXMin        = 20.0;          // Минимум ADX для входа
+input double            InpADXMin        = 10.0;          // Минимум ADX для входа (ослаблено для большего количества входов)
 
-input bool              InpUseTrendFilter= true;          // Уровень 3: MA(200) - фильтр направления (BUY выше, SELL ниже)
+input bool              InpUseTrendFilter= false;         // Уровень 3: MA(200) - фильтр направления (отключен для максимума входов)
 input int               InpMATrendPeriod = 200;           // Период MA для фильтра тренда
 input ENUM_MA_METHOD    InpMAMethod      = MODE_SMA;      // Метод MA
 
@@ -125,7 +135,7 @@ input ENUM_RSIBB_MODE    InpRSIBB_Mode        = RSIBB_MODE_EXTREME; // Режи�
 input double             InpRSIBB_Tolerance   = 0.0;          // Допуск от полосы (ед. RSI)
 
 input group "=== ВРЕМЕННЫЕ СЕССИИ (GMT) ==="
-input bool              InpUseSessionFilter   = true;         // ГЛАВНЫЙ ВЫКЛЮЧАТЕЛЬ: фильтр временных сессий
+input bool              InpUseSessionFilter   = false;        // ГЛАВНЫЙ ВЫКЛЮЧАТЕЛЬ: фильтр временных сессий (отключен для 24/7 торговли)
 input bool              InpEnableASIA         = true;         // Включить ASIATIC (00:00-08:00 GMT)
 input bool              InpEnableLONDON       = true;         // Включить LONDON (08:00-16:00 GMT)
 input bool              InpEnableNEWYORK      = true;         // Включить NEWYORK (13:00-21:00 GMT)
@@ -557,9 +567,9 @@ double CalculateDynamicRR()
    double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
    double atrPts = atr / point;
 
-   // Диапазон волатильности (в пунктах)
-   const double MIN_VOLATILITY_PTS = 10.0;
-   const double MAX_VOLATILITY_PTS = 100.0;
+   // Диапазон волатильности (расширенный для максимума входов: 5-150 пт)
+   const double MIN_VOLATILITY_PTS = 5.0;
+   const double MAX_VOLATILITY_PTS = 150.0;
 
    // Динамический RR: базовый 2.0 + волатильность фактор (от 0 до 1.5)
    // Когда ATR низкий: RR = 2.0
@@ -850,9 +860,9 @@ bool CheckVolatilityFilter()
    double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
    double atrPts = atr / point;
 
-   // Волатильность средняя: ATR в диапазоне 10-100 пт (оптимально для торговли)
-   const double MIN_VOLATILITY_PTS = 10.0;
-   const double MAX_VOLATILITY_PTS = 100.0;
+   // Волатильность: расширенный диапазон 5-150 пт (для максимума входов)
+   const double MIN_VOLATILITY_PTS = 5.0;
+   const double MAX_VOLATILITY_PTS = 150.0;
 
    if(atrPts < MIN_VOLATILITY_PTS)
    {
