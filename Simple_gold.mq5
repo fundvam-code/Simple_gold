@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
 //|                                                  Simple_gold_v5.mq5 |
 //|                                      Copyright 2026, Bondarev A.   |
-//|  v5.10: WAIT валидация + pin-bar вход + динамический RR + фильтры   |
+//|  v5.12: WAIT валидация + pin-bar (M1, настраиваемый) + динамич. RR + BB    |
 //+------------------------------------------------------------------+
-//| ОСНОВНЫЕ УЛУЧШЕНИЯ v5.10:                                          |
+//| ОСНОВНЫЕ УЛУЧШЕНИЯ v5.12 (параметризация pin-bar):                                          |
 //|                                                                    |
 //|  1. ФИКСАЦИЯ WAIT ЦИКЛА:                                           |
 //|     - ValidateWaitState() проверяет консистентность каждый тик    |
@@ -14,6 +14,8 @@
 //|     - CheckPinBarConfirm() - детекция pin-bar вместо просто свечи  |
 //|       BUY: длинный нижний хвост + close>open                     |
 //|       SELL: длинный верхний хвост + close<open                   |
+//|     - InpPinBarTailRatio - настраиваемое соотношение хвоста/тела   |
+//|       (по умолчанию 2.0 = хвост в 2 раза больше тела)             |
 //|     - CheckVolatilityFilter() - фильтр волатильности (ATR H1)      |
 //|       Принимает: 10-100 пункты                                    |
 //|       Отклоняет: <10 (слишком тихо) или >100 (хаос)               |
@@ -30,11 +32,18 @@
 //|     - Уровень 3: MA(200) (BUY: выше MA, SELL: ниже MA)            |
 //|     - Уровень 4: Волатильность (10-100 пункты ATR H1)             |
 //|                                                                    |
+//|  5. НЕЗАВИСИМЫЕ ЛИНИИ БОЛЛИНДЖЕРА:                                 |
+//|     - Используют ТОЛЬКО InpMainTF (основной ТФ советника)         |
+//|     - НЕ зависят от ТФ графика при открытии или тестировании      |
+//|     - Pin-bar проверяется ТОЛЬКО на M1 (жёсткое ограничение)      |
+//|     - Касание BB: считается на InpMainTF                          |
+//|     - Отрисовка линий: по InpMainTF (независимо от графика)       |
+//|                                                                    |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Bondarev A."
 #property link      "https://www.mql5.com"
-#property version   "5.10"
-#property description "XAUUSD M15 с BB, pin-bar входом, динамическим RR, WAIT валидацией и 4-мя фильтрами"
+#property version   "5.12"
+#property description "XAUUSD: WAIT валидация + pin-bar (M1, настраиваемое соотношение) + динамический RR + 4 фильтра + BB на InpMainTF"
 
 #include <Trade\Trade.mqh>
 
@@ -59,6 +68,9 @@ input bool              InpAutoMode      = true;          // true = авто, fa
 input double            InpBBOffsetPts   = 0.0;           // Смещение касания BB (пт)
 input bool              InpAllowBuy      = true;          // Разрешить BUY вход
 input bool              InpAllowSell     = true;          // Разрешить SELL вход
+
+input group "=== Определение Pin-Bar (подтверждение входа) ==="
+input double            InpPinBarTailRatio = 2.0;         // Коэффициент хвоста: хвост > тело × этот коэф. (2.0 = хвост в 2 раза больше тела)
 input int               InpConfirmMaxBars = 10;           // Окно подтверждения pin-bar: макс. свечей M1 (0 = без лимита)
 
 input group "=== Логика отката (WAIT) с валидацией ==="
@@ -438,11 +450,11 @@ int ReadIndicators(double &up, double &mid, double &low, double &atr,
    ArraySetAsSeries(b, true);
    if(CopyBuffer(m_adxHandle, 0, 1, 1, b) == 1) adx = b[0];
 
-   // Касание на M1 (предпоследний закрытый бар)
+   // Касание на InpMainTF (предпоследний закрытый бар, независимо от графика)
    double m1Hi[], m1Lo[];
    ArraySetAsSeries(m1Hi, true); ArraySetAsSeries(m1Lo, true);
-   if(CopyHigh(m_symbol, PERIOD_M1, 1, 2, m1Hi) != 2) return -1;
-   if(CopyLow(m_symbol, PERIOD_M1, 1, 2, m1Lo) != 2)  return -1;
+   if(CopyHigh(m_symbol, InpMainTF, 1, 2, m1Hi) != 2) return -1;
+   if(CopyLow(m_symbol, InpMainTF, 1, 2, m1Lo) != 2)  return -1;
 
    double touchOff = InpBBOffsetPts * point;
    bool tLow  = (m1Lo[1] <= low + touchOff);
@@ -715,8 +727,8 @@ bool CheckPinBarConfirm(const int direction)  // direction: +1 = BUY, -1 = SELL
       double tailSize = MathAbs(o[0] - l[0]);
       double topSize  = MathAbs(h[0] - c[0]);
 
-      // Нижняя тень > 2 * тела (пин-бар)
-      pinBarBody = (tailSize > bodySize * 2.0);
+      // Нижняя тень > тела * InpPinBarTailRatio (пин-бар)
+      pinBarBody = (tailSize > bodySize * InpPinBarTailRatio);
       // Close > Open (верное направление)
       correctClose = (c[0] > o[0]);
    }
@@ -726,8 +738,8 @@ bool CheckPinBarConfirm(const int direction)  // direction: +1 = BUY, -1 = SELL
       double tailSize = MathAbs(h[0] - o[0]);
       double botSize  = MathAbs(c[0] - l[0]);
 
-      // Верхняя тень > 2 * тела (пин-бар)
-      pinBarBody = (tailSize > bodySize * 2.0);
+      // Верхняя тень > тела * InpPinBarTailRatio (пин-бар)
+      pinBarBody = (tailSize > bodySize * InpPinBarTailRatio);
       // Close < Open (верное направление)
       correctClose = (c[0] < o[0]);
    }
